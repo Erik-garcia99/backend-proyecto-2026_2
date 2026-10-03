@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: selfiq-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-selfiq}
+      POSTGRES_USER: ${POSTGRES_USER:-selfiq}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-selfiq_dev_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./selfiq_sprint1_postgresql.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+      - ./scripts/seed_auth.sql:/docker-entrypoint-initdb.d/02_seed_auth.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: .
+    container_name: selfiq-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-selfiq}:${POSTGRES_PASSWORD:-selfiq_dev_password}@db:5432/${POSTGRES_DB:-selfiq}
+      JWT_SECRET: ${JWT_SECRET:-cambia-esta-clave-en-produccion}
+      ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES:-60}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

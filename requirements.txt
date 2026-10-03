@@ -1,2 +1,6 @@
 fastapi
 uvicorn[standard]
+psycopg[binary,pool]
+bcrypt
+PyJWT
+email-validator
