@@ -5,8 +5,8 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi",
     "uvicorn",
-    psycopg[binary,pool],
-    bcrypt,
-    PyJWT,
-    email-validator
+    "psycopg[binary,pool]",
+    "bcrypt",
+    "PyJWT",
+    "email-validator",
 ]
