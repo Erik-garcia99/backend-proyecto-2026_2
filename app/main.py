@@ -1,255 +1,140 @@
+import asyncio
 from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
-
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg.errors import UniqueViolation
-
 from . import db
-from .schemas import (BranchCreateRequest, BranchResponse, LoginRequest, LoginResponse,
+from .config import SELFIQ_GATEWAYS
+from .gateways import GatewayHub, create_router
+from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
+from .schemas import (BranchCreateRequest, BranchCreatedResponse, LoginRequest, LoginResponse,
                       RegisterRequest, RegisterResponse, UserResponse)
-from .security import (
-    create_access_token,
-    decode_access_token,
-    hash_password,
-    hash_registration_token,
-    verify_password,
-)
+from .security import (create_access_token, decode_access_token, hash_password,
+                       hash_registration_token, verify_password, generate_registration_token)
 
+gateway_hub = GatewayHub(SELFIQ_GATEWAYS,
+    validate_token=lambda branch_id, digest: validate_branch_token(db.get_connection, branch_id, digest))
 
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(_):
     db.pool.open()
     try:
+        await asyncio.to_thread(db.pool.wait, 30)
         yield
     finally:
+        await gateway_hub.close()
         db.pool.close()
 
-
-app = FastAPI(title="SelfIQ API", version="1.0.0", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title='SelfIQ API', version='2.0.0', lifespan=lifespan)
+app.state.gateway_hub = gateway_hub
+app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False,
+                   allow_methods=['*'], allow_headers=['*'])
 bearer = HTTPBearer(auto_error=False)
 
+def user_response(user):
+    state = 'PENDING_APPROVAL' if user['account_status']=='pending' else user['account_status'].upper()
+    return UserResponse(id=str(user['id']), email=user['email'], first_name=user['first_name'],
+        last_name=user['last_name'], is_superuser=user['role'].lower() == 'sudo', account_status=state,
+        role=user['role'], organization_id=str(user['organization_id']),
+        branch_id=str(user['branch_id']) if user['branch_id'] else None)
 
-def user_response(user: dict) -> UserResponse:
-    return UserResponse(
-        id=str(user["id"]), email=user["email"], first_name=user["first_name"],
-        last_name=user["last_name"], is_superuser=user["is_superuser"],
-        account_status=user["account_status"],
-    )
-
-
-@app.get("/health")
+@app.get('/health')
 def health():
-    return {"status": "ok"}
+    return {'status': 'ok'}
 
-
-@app.post("/auth/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)
+@app.post('/auth/register', response_model=RegisterResponse, status_code=201)
 def register(request: RegisterRequest):
-    token_hash = hash_registration_token(request.registration_token)
     with db.get_connection() as connection:
         try:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT id, branch_id, max_uses, uses
-                    FROM branch_registration_token
-                    WHERE token_hash = %s AND token_type = 'USER_REGISTRATION'
-                      AND is_active = TRUE
-                      AND (expires_at IS NULL OR expires_at > NOW())
-                      AND (max_uses IS NULL OR uses < max_uses)
-                    FOR UPDATE
-                    """,
-                    (token_hash,),
-                )
-                registration_token = cursor.fetchone()
-                if not registration_token:
-                    raise HTTPException(status_code=400, detail="Token de registro inválido o expirado")
-
-                cursor.execute("SELECT id FROM users WHERE email = %s", (str(request.email).lower(),))
-                if cursor.fetchone():
-                    raise HTTPException(status_code=409, detail="El correo ya está registrado")
-
-                cursor.execute(
-                    """
-                    INSERT INTO users (email, password_hash, first_name, last_name, phone, account_status)
-                    VALUES (%s, %s, %s, %s, %s, 'PENDING_APPROVAL')
-                    RETURNING id, account_status
-                    """,
-                    (str(request.email).lower(), hash_password(request.password), request.first_name,
-                     request.last_name, request.phone),
-                )
-                user = cursor.fetchone()
-                cursor.execute(
-                    """
-                    INSERT INTO user_branch (user_id, branch_id, membership_status)
-                    VALUES (%s, %s, 'PENDING')
-                    """,
-                    (user["id"], registration_token["branch_id"]),
-                )
-                cursor.execute(
-                    "UPDATE branch_registration_token SET uses = uses + 1 WHERE id = %s",
-                    (registration_token["id"],),
-                )
+                cursor.execute('''SELECT t.id, t.branch_id, t.organization_id FROM organization_token t
+                    JOIN branch b ON b.id=t.branch_id AND b.organization_id=t.organization_id
+                    JOIN organization o ON o.id=b.organization_id
+                    WHERE t.token_hash=%s AND t.is_active AND t.revoked_at IS NULL
+                      AND b.is_active AND o.is_active AND 'register_user'=ANY(t.scopes)
+                      AND (t.expires_at IS NULL OR t.expires_at>NOW())
+                      AND (t.max_uses IS NULL OR t.use_count<t.max_uses) FOR UPDATE OF t''',
+                    (hash_registration_token(request.registration_token),))
+                token=cursor.fetchone()
+                if not token: raise HTTPException(400,'Token de sucursal inválido o expirado')
+                cursor.execute('''INSERT INTO "user" (organization_id,branch_id,email,first_name,last_name,
+                    phone_number,password_hash,role,account_status)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,'employee','pending') RETURNING id''',
+                    (token['organization_id'],token['branch_id'],request.email.lower(),request.first_name,
+                     request.last_name,request.phone,hash_password(request.password)))
+                user=cursor.fetchone()
+                cursor.execute('UPDATE organization_token SET use_count=use_count+1,last_used_at=NOW() WHERE id=%s',(token['id'],))
             connection.commit()
         except UniqueViolation:
             connection.rollback()
-            raise HTTPException(status_code=409, detail="El correo ya está registrado")
-        except HTTPException:
-            connection.rollback()
-            raise
+            raise HTTPException(409,'El correo ya está registrado')
+    return RegisterResponse(message='Cuenta creada; queda pendiente de aprobación',user_id=str(user['id']),account_status='PENDING_APPROVAL')
 
-    return RegisterResponse(message="Cuenta creada; queda pendiente de aprobación", user_id=str(user["id"]), account_status=user["account_status"])
-
-
-@app.post("/auth/login", response_model=LoginResponse)
+@app.post('/auth/login', response_model=LoginResponse)
 def login(request: LoginRequest):
     with db.get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM users WHERE email = %s", (str(request.email).lower(),))
-            user = cursor.fetchone()
-            if not user or not verify_password(request.password, user["password_hash"]):
-                raise HTTPException(status_code=401, detail="Credenciales incorrectas")
-            if not user["is_active"] or user["account_status"] != "ACTIVE":
-                raise HTTPException(status_code=403, detail="La cuenta no está activa o aprobada")
-            cursor.execute("UPDATE users SET last_login_at = NOW() WHERE id = %s", (user["id"],))
-        connection.commit()
-    return LoginResponse(access_token=create_access_token(str(user["id"])), user=user_response(user))
+        user=connection.execute('SELECT * FROM "user" WHERE lower(email)=%s',(request.email.lower(),)).fetchone()
+    if not user or not verify_password(request.password,user['password_hash']):
+        raise HTTPException(401,'Credenciales incorrectas')
+    if user['deactivated_at'] is not None or user['account_status']!='active':
+        raise HTTPException(403,'La cuenta no está activa o aprobada')
+    return LoginResponse(access_token=create_access_token(str(user['id'])),user=user_response(user))
 
-
-def current_user(credentials: HTTPAuthorizationCredentials = Depends(bearer)):
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Se requiere un token Bearer")
-    try:
-        payload = decode_access_token(credentials.credentials)
-        user_id = UUID(payload["sub"])
-    except (jwt.InvalidTokenError, KeyError, ValueError):
-        raise HTTPException(status_code=401, detail="Token inválido o expirado")
-
+def current_user(credentials: HTTPAuthorizationCredentials=Depends(bearer)):
+    if not credentials:raise HTTPException(401,'Se requiere un token Bearer')
+    try: user_id=UUID(decode_access_token(credentials.credentials)['sub'])
+    except (jwt.InvalidTokenError,KeyError,ValueError):raise HTTPException(401,'Token inválido o expirado')
     with db.get_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT * FROM users WHERE id = %s AND is_active = TRUE", (user_id,))
-            user = cursor.fetchone()
-    if not user or user["account_status"] != "ACTIVE":
-        raise HTTPException(status_code=403, detail="La cuenta no está activa")
+        user=connection.execute('SELECT *, (lower(role)=\'sudo\') AS is_superuser FROM "user" WHERE id=%s AND deactivated_at IS NULL',(user_id,)).fetchone()
+    if not user or user['account_status']!='active':raise HTTPException(403,'La cuenta no está activa')
     return user
 
-
-@app.get("/auth/me", response_model=UserResponse)
-def me(user: dict = Depends(current_user)):
+@app.get('/auth/me',response_model=UserResponse)
+def me(user=Depends(current_user)):
     return user_response(user)
 
-
-@app.post("/branches", response_model=BranchResponse, status_code=status.HTTP_201_CREATED)
-def create_branch(request: BranchCreateRequest, creator: dict = Depends(current_user)):
-    """Crea una sucursal usando un token de creación válido."""
-    with db.get_connection() as connection:
-        try:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT t.id, t.branch_id, t.max_uses, t.uses, b.business_id
-                    FROM branch_registration_token t
-                    JOIN branch b ON b.id = t.branch_id
-                    WHERE t.token_hash = %s AND t.token_type = 'BRANCH_CREATION'
-                      AND t.is_active = TRUE
-                      AND (t.expires_at IS NULL OR t.expires_at > NOW())
-                      AND (t.max_uses IS NULL OR t.uses < t.max_uses)
-                    FOR UPDATE
-                    """,
-                    (hash_registration_token(request.registration_token),),
-                )
-                token = cursor.fetchone()
-                if not token:
-                    raise HTTPException(status_code=400, detail="Token de sucursal inválido o expirado")
-
-                if not creator["is_superuser"]:
-                    cursor.execute(
-                        """
-                        SELECT 1 FROM user_branch ub
-                        JOIN role r ON r.id = ub.role_id
-                        WHERE ub.user_id = %s AND ub.branch_id = %s
-                          AND ub.membership_status = 'ACTIVE'
-                          AND r.name IN ('OWNER', 'MANAGER')
-                        LIMIT 1
-                        """,
-                        (creator["id"], token["branch_id"]),
-                    )
-                    if not cursor.fetchone():
-                        raise HTTPException(status_code=403, detail="No tienes permisos para crear sucursales")
-
-                code = f"SUC-{str(uuid4())[:8].upper()}"
-                cursor.execute(
-                    """
-                    INSERT INTO branch (business_id, name, code, address, timezone, business_category)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id, name, code, address, timezone, business_category, business_id
-                    """,
-                    (token["business_id"], request.name, code, request.address,
-                     request.timezone, request.category),
-                )
-                branch = cursor.fetchone()
-                cursor.execute(
-                    "UPDATE branch_registration_token SET uses = uses + 1 WHERE id = %s",
-                    (token["id"],),
-                )
-            connection.commit()
-        except HTTPException:
-            connection.rollback()
-            raise
-
-    return BranchResponse(
-        id=str(branch["id"]), name=branch["name"], code=branch["code"],
-        address=branch["address"], timezone=branch["timezone"],
-        category=branch["business_category"], business_id=str(branch["business_id"]),
-    )
-
-
-@app.post("/auth/approve/{user_id}", response_model=UserResponse)
-def approve_user(user_id: UUID, approver: dict = Depends(current_user)):
-    """Activa una cuenta pendiente; disponible para SUDO o MANAGER."""
+@app.post('/branches',response_model=BranchCreatedResponse,status_code=201)
+def create_branch(request: BranchCreateRequest,response:Response,creator=Depends(current_user)):
+    branch_token=generate_registration_token()
     with db.get_connection() as connection:
         with connection.cursor() as cursor:
-            if not approver["is_superuser"]:
-                cursor.execute(
-                    """
-                    SELECT 1 FROM user_branch ub
-                    JOIN role r ON r.id = ub.role_id
-                    WHERE ub.user_id = %s AND ub.membership_status = 'ACTIVE'
-                      AND r.name IN ('MANAGER', 'OWNER')
-                    LIMIT 1
-                    """,
-                    (approver["id"],),
-                )
-                if not cursor.fetchone():
-                    raise HTTPException(status_code=403, detail="No tienes permisos para aprobar cuentas")
-
-            cursor.execute(
-                """
-                UPDATE users SET account_status = 'ACTIVE'
-                WHERE id = %s AND account_status = 'PENDING_APPROVAL'
-                RETURNING *
-                """,
-                (user_id,),
-            )
-            approved = cursor.fetchone()
-            if not approved:
-                raise HTTPException(status_code=404, detail="Cuenta pendiente no encontrada")
-            cursor.execute(
-                """
-                UPDATE user_branch SET membership_status = 'ACTIVE', approved_by = %s,
-                    approved_at = NOW()
-                WHERE user_id = %s AND membership_status = 'PENDING'
-                """,
-                (approver["id"], user_id),
-            )
+            cursor.execute('''SELECT t.id,t.business_id FROM business_registration_token t
+                JOIN organization o ON o.id=t.business_id WHERE t.token_hash=%s AND t.is_active AND o.is_active
+                AND (t.expires_at IS NULL OR t.expires_at>NOW())
+                AND (t.max_uses IS NULL OR t.uses<t.max_uses) FOR UPDATE OF t''',(hash_registration_token(request.registration_token),))
+            token=cursor.fetchone()
+            if not token:raise HTTPException(400,'Token global de empresa inválido o expirado')
+            if not creator['is_superuser'] and not (creator['role'].lower()=='owner' and creator['organization_id']==token['business_id']):
+                raise HTTPException(403,'Se requiere SUDO o OWNER de esta empresa')
+            code='SUC-'+uuid4().hex[:8].upper()
+            cursor.execute('''INSERT INTO branch(organization_id,name,branch_code,address,timezone,business_category)
+                VALUES(%s,%s,%s,%s,%s,%s) RETURNING *''',(token['business_id'],request.name,code,request.address,request.timezone,request.category))
+            branch=cursor.fetchone()
+            cursor.execute('''INSERT INTO organization_token(organization_id,branch_id,token_hash,token_prefix,created_by)
+                VALUES(%s,%s,%s,%s,%s)''',(branch['organization_id'],branch['id'],hash_registration_token(branch_token),branch_token[:8],creator['id']))
+            cursor.execute('UPDATE business_registration_token SET uses=uses+1 WHERE id=%s',(token['id'],))
         connection.commit()
-    return user_response(approved)
+    response.headers['Cache-Control']='no-store'
+    return BranchCreatedResponse(id=str(branch['id']),name=branch['name'],code=branch['branch_code'],
+        address=branch['address'],timezone=branch['timezone'],category=branch['business_category'],
+        business_id=str(branch['organization_id']),branch_token=branch_token)
+
+@app.post('/auth/approve/{user_id}',response_model=UserResponse)
+def approve_user(user_id:UUID,approver=Depends(current_user)):
+    with db.get_connection() as connection:
+        target=connection.execute('SELECT * FROM "user" WHERE id=%s AND account_status=\'pending\' AND deactivated_at IS NULL FOR UPDATE',(user_id,)).fetchone()
+        if not target:raise HTTPException(404,'Cuenta pendiente no encontrada')
+        require_branch_access(approver,target['branch_id'],target['organization_id'])
+        user=connection.execute('UPDATE "user" SET account_status=\'active\',updated_at=NOW() WHERE id=%s RETURNING *',(user_id,)).fetchone()
+        connection.execute('''INSERT INTO user_management(manager_id,employee_id,branch_id,assigned_role,updated_by)
+            VALUES(%s,%s,%s,%s,%s) ON CONFLICT(manager_id,employee_id,branch_id)
+            DO UPDATE SET is_active=TRUE,assigned_role=EXCLUDED.assigned_role,updated_by=EXCLUDED.updated_by''',
+            (approver['id'],user['id'],user['branch_id'],user['role'],approver['id']))
+        connection.commit()
+    return user_response(user)
+
+app.include_router(create_router(gateway_hub,current_user,db.get_connection))
+app.include_router(token_router(current_user,db.get_connection,gateway_hub))

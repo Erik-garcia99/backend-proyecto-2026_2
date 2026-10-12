@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
-import hashlib
+import secrets
+from .security_tokens import token_hash
 
 import bcrypt
 import jwt
@@ -19,7 +20,11 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 
 def hash_registration_token(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+    return token_hash(token)
+
+
+def generate_registration_token() -> str:
+    return secrets.token_urlsafe(32)
 
 
 def create_access_token(user_id: str) -> str:

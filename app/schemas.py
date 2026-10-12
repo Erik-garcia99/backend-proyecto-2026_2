@@ -29,6 +29,9 @@ class UserResponse(BaseModel):
     last_name: str
     is_superuser: bool
     account_status: str
+    role: str
+    organization_id: str
+    branch_id: str | None = None
 
 
 class LoginResponse(BaseModel):
@@ -61,3 +64,18 @@ class BranchResponse(BaseModel):
     timezone: str
     category: str
     business_id: str
+
+
+class BranchCreatedResponse(BranchResponse):
+    # Returned only on creation; the original token isn't stored/recoverable.
+    branch_token: str
+
+
+class BusinessTokenResponse(BaseModel):
+    business_id: str
+    business_token: str
+
+
+class BranchTokenResponse(BaseModel):
+    branch_id: str
+    branch_token: str
