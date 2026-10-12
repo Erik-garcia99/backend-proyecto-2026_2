@@ -7,7 +7,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg.errors import UniqueViolation
 from . import db
-from .config import SELFIQ_GATEWAYS
 from .gateways import GatewayHub, create_router
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, LoginRequest, LoginResponse,
@@ -15,7 +14,7 @@ from .schemas import (BranchCreateRequest, BranchCreatedResponse, LoginRequest, 
 from .security import (create_access_token, decode_access_token, hash_password,
                        hash_registration_token, verify_password, generate_registration_token)
 
-gateway_hub = GatewayHub(SELFIQ_GATEWAYS,
+gateway_hub = GatewayHub(db.get_connection,
     validate_token=lambda branch_id, digest: validate_branch_token(db.get_connection, branch_id, digest))
 
 @asynccontextmanager

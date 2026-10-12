@@ -4,3 +4,4 @@ psycopg[binary,pool]
 bcrypt
 PyJWT
 email-validator
+cryptography>=43,<51
