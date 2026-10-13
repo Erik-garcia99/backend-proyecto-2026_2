@@ -1,11 +1,11 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import secrets
 from .security_tokens import token_hash
 
 import bcrypt
 import jwt
 
-from .config import ACCESS_TOKEN_MINUTES, JWT_ALGORITHM, JWT_SECRET
+from .config import JWT_ALGORITHM, JWT_SECRET
 
 
 def hash_password(password: str) -> str:
@@ -32,7 +32,6 @@ def create_access_token(user_id: str) -> str:
     payload = {
         "sub": user_id,
         "iat": now,
-        "exp": now + timedelta(minutes=ACCESS_TOKEN_MINUTES),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 

@@ -27,7 +27,6 @@ services:
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-selfiq}:${POSTGRES_PASSWORD:-selfiq_dev_password}@db:5432/${POSTGRES_DB:-selfiq}
       JWT_SECRET: ${JWT_SECRET:-cambia-esta-clave-en-produccion}
-      ACCESS_TOKEN_MINUTES: ${ACCESS_TOKEN_MINUTES:-60}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     depends_on:
