@@ -1,2 +1,5 @@
 .env
 .dockerignore
+
+app/__pycache__/*
+
