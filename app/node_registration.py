@@ -1,8 +1,8 @@
 """Registro idempotente de ESP32 por gateway ya enrolado (Ed25519 + WSS)."""
 import base64
 import re
+import logging
 import time
-from datetime import datetime, timezone
 from uuid import UUID
 
 from cryptography.exceptions import InvalidSignature
@@ -11,7 +11,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from .gateway_registry import active_token
-from .security_tokens import token_hash
+
+log = logging.getLogger('selfiq.nodes')
 
 MAC_RE = re.compile(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$')
 NODE_TYPES = {'guide', 'access_counter', 'shelf_cam', 'environment'}
@@ -52,10 +53,10 @@ def make_router(get_connection, hub, current_user):
                 JOIN branch b ON b.id=g.branch_id JOIN organization o ON o.id=b.organization_id
                 WHERE g.rpi_identifier=%s AND g.is_active AND b.is_active AND o.is_active''',
                 (gateway_id,)).fetchone()
-            session = hub.sessions.get(gateway_id)
-            if (not gateway or not gateway['device_public_key'] or not session
-                    or not session['authorized'] or str(session['branch_id']) != str(gateway['branch_id'])):
-                raise HTTPException(403, 'Gateway desconectado o sin autorización')
+            # REST puede llegar a otro worker: autenticar contra la identidad
+            # persistida y el token vigente, no contra sesiones WSS en memoria.
+            if not gateway or not gateway['device_public_key']:
+                raise HTTPException(403, 'Gateway no registrado o desactivado')
             if not gateway['token_hash'] or not active_token(conn, gateway['token_hash'], gateway['branch_id']):
                 raise HTTPException(403, 'Token de sucursal revocado')
             try:
@@ -82,6 +83,8 @@ def make_router(get_connection, hub, current_user):
                          registered_at=COALESCE(registered_at,NOW()),updated_at=NOW()
                          WHERE id=%s''', (row['id'],))
             conn.commit()
+        log.info('ESP32 registrada: MAC=%s ID=%s sucursal=%s existente=%s',
+                 body.mac_address, row['id'], gateway['branch_id'], not bool(inserted))
         return {'mac_address': body.mac_address, 'esp_id': str(row['id']),
                 'branch_id': str(gateway['branch_id']), 'node_type': body.node_type,
                 'registration_status': 'registered', 'already_registered': not bool(inserted)}
