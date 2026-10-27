@@ -2,6 +2,11 @@
 
 Backend en la nube para el sistema IoT desarrollado como parte del proyecto de carrera de Ingeniería en Computación.
 
+## Temperatura desde InfluxDB Cloud
+
+Configuración local, credenciales seguras y variables de Railway:
+[TELEMETRIA.md](TELEMETRIA.md). Plantilla sin secretos: [`.env.example`](.env.example).
+
 Este repositorio contiene exclusivamente el servicio backend encargado de recibir, validar, procesar y almacenar la información enviada desde el gateway local del sistema.
 
 ## Descripción

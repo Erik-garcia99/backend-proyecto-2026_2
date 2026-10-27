@@ -1,5 +1,8 @@
 .env
-.dockerignore
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.pyc
 
 app/__pycache__/*
-
