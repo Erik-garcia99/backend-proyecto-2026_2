@@ -14,6 +14,12 @@ Antes de llenar variables, abre la consola de InfluxDB:
   Esta opción no está diseñada para Cloud Dedicated ni otros productos v3.
 - Que la Raspberry escriba en `/api/v2/write` **no demuestra** que sea Cloud 2.
 
+> **Importante en v3:** `/query` con InfluxQL exige un mapeo **DBRP**
+> (database + retention policy → bucket). El editor **SQL** de InfluxDB no usa
+> DBRP, así que una consulta SQL puede funcionar aunque `/query` falle con
+> `database not found` (la API lo devuelve como 502 en el backend).
+> `INFLUXDB_DATABASE` no es el nombre del bucket: es el `database` del mapeo DBRP.
+
 En Data Explorer, o en el código de escritura de la Raspberry, identifica:
 
 1. Bucket; organización para v2 o base de datos mapeada al bucket para v3.
@@ -124,6 +130,42 @@ al cambiar sucursal no muestra la lectura de la anterior.
 - `504`: tiempo de espera agotado.
 - `403`: el usuario no pertenece a la sucursal autorizada.
 
+### Si aparece 502 en v3 (`database not found`)
+
+El backend escribe en el log el estado HTTP y el mensaje de InfluxDB, por ejemplo:
+
+```text
+InfluxDB respondió HTTP 200 (db='...' rp='' measurement='temperature' field='value'): database not found: ...
+```
+
+Lista los mapeos DBRP existentes (no pegues el token en el chat):
+
+```bash
+curl -s "https://TU-HOST.influxdata.com/api/v2/dbrps?orgID=TU_ORG_ID" \
+  -H "Authorization: Token $INFLUX_TOKEN" | jq
+```
+
+Si no existe ninguno para el bucket, créalo (requiere un token con permiso para
+administrar DBRP; el token de solo lectura del backend no sirve para crearlo):
+
+```bash
+curl -s -X POST "https://TU-HOST.influxdata.com/api/v2/dbrps" \
+  -H "Authorization: Token $INFLUX_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"bucketID":"TU_BUCKET_ID","database":"selfiq","default":true,"orgID":"TU_ORG_ID","retention_policy":"autogen"}'
+```
+
+Después configura en Railway:
+
+```dotenv
+INFLUXDB_DATABASE=selfiq
+INFLUXDB_RETENTION_POLICY=autogen
+```
+
+El `bucketID` se obtiene en la UI del bucket o con `influx bucket list`.
+No cambies `INFLUXDB_MEASUREMENT=temperature`, `INFLUXDB_TEMPERATURE_FIELD=value`
+ni `INFLUXDB_BRANCH_TAG=branch_id`: ya coinciden con los datos reales.
+
 ## Alcance y pruebas
 
 Se implementa la visualización de **temperatura del sensor instalado** (modelo
@@ -131,7 +173,8 @@ por confirmar: DHT11/DHT22 u otro), no humedad,
 históricos, alertas push, LWT ni monitoreo de conexión del sensor.
 Una lectura vieja no demuestra por sí sola que un nodo esté desconectado.
 F-07 del PDF menciona **DHT22 y humedad**: esta integración parcial no implica
-cumplir todo ese requerimiento. Se muestra un aviso local sobre 40 °C.
+cumplir todo ese requerimiento. En la app el rojo se activa desde 35 °C (umbral
+visual elegido); F-07 indica alerta por encima de 40 °C.
 Se siguen los criterios de secretos fuera de Git y acceso autorizado (SEC-08,
 SEC-12, SEC-14, SEC-15, SEC-16), sin auditar el resto del sistema.
 
