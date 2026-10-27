@@ -5,3 +5,5 @@ bcrypt
 PyJWT
 email-validator
 cryptography>=43,<51
+httpx>=0.28,<1
+python-dotenv>=1,<2
