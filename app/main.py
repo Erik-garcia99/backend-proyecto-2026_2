@@ -133,6 +133,59 @@ def change_password(request:PasswordChangeRequest,user=Depends(current_user)):
         connection.commit()
     return MessageResponse(message='Contraseña actualizada')
 
+PROFILE_FIELDS={'first_name':'El nombre','last_name':'El apellido','email':'El correo'}
+
+@app.patch('/auth/me',response_model=UserResponse)
+def update_me(request:ProfileUpdateRequest,user=Depends(current_user)):
+    changes=request.model_dump(exclude_unset=True)
+    for field,label in PROFILE_FIELDS.items():
+        if field in changes and changes[field] is None:
+            raise HTTPException(422,f'{label} no puede estar vacío')
+    if 'email' in changes:changes['email']=changes['email'].lower()
+    if 'phone_number' in changes:changes['phone_number']=changes['phone_number'] or None
+    if not changes:return user_response(user)
+    assignments=', '.join(f'{field}=%s' for field in changes)
+    try:
+        with db.get_connection() as connection:
+            updated=connection.execute(f'UPDATE "user" SET {assignments}, updated_at=NOW() WHERE id=%s RETURNING *',
+                (*changes.values(),user['id'])).fetchone()
+            connection.commit()
+    except UniqueViolation:
+        raise HTTPException(409,'El correo ya está registrado')
+    if not updated:raise HTTPException(404,'Usuario no encontrado')
+    return user_response(updated)
+
+@app.post('/auth/change-password',response_model=MessageResponse)
+def change_password(request:PasswordChangeRequest,user=Depends(current_user)):
+    if not verify_password(request.current_password,user['password_hash']):
+        raise HTTPException(400,'La contraseña actual no es correcta')
+    if request.new_password==request.current_password:
+        raise HTTPException(400,'La nueva contraseña debe ser distinta de la actual')
+    with db.get_connection() as connection:
+        connection.execute('UPDATE "user" SET password_hash=%s, updated_at=NOW() WHERE id=%s',
+            (hash_password(request.new_password),user['id']))
+        connection.commit()
+    return MessageResponse(message='Contraseña actualizada')
+
+@app.get('/auth/me/preferences',response_model=NotificationPreferences)
+def get_preferences(user=Depends(current_user)):
+    with db.get_connection() as connection:
+        row=connection.execute('SELECT low_stock, capacity, temperature, offline, sound FROM user_preference WHERE user_id=%s',
+            (user['id'],)).fetchone()
+    return NotificationPreferences(**(row or {}))
+
+@app.put('/auth/me/preferences',response_model=NotificationPreferences)
+def update_preferences(request:NotificationPreferencesUpdate,user=Depends(current_user)):
+    with db.get_connection() as connection:
+        row=connection.execute('''INSERT INTO user_preference(user_id,low_stock,capacity,temperature,offline,sound)
+            VALUES(%s,%s,%s,%s,%s,%s)
+            ON CONFLICT(user_id) DO UPDATE SET low_stock=EXCLUDED.low_stock,capacity=EXCLUDED.capacity,
+                temperature=EXCLUDED.temperature,offline=EXCLUDED.offline,sound=EXCLUDED.sound,updated_at=NOW()
+            RETURNING low_stock, capacity, temperature, offline, sound''',
+            (user['id'],request.low_stock,request.capacity,request.temperature,request.offline,request.sound)).fetchone()
+        connection.commit()
+    return NotificationPreferences(**row)
+
 @app.post('/branches',response_model=BranchCreatedResponse,status_code=201)
 def create_branch(request: BranchCreateRequest,response:Response,creator=Depends(current_user)):
     branch_token=generate_registration_token()

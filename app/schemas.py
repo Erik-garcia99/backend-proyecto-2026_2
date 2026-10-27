@@ -54,6 +54,41 @@ class MessageResponse(BaseModel):
     message: str
 
 
+class ProfileUpdateRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    first_name: str | None = Field(default=None, min_length=1, max_length=100)
+    last_name: str | None = Field(default=None, min_length=1, max_length=100)
+    email: str | None = Field(default=None, min_length=3, max_length=320, pattern=EMAIL_PATTERN)
+    phone_number: str | None = Field(default=None, max_length=30)
+
+
+class PasswordChangeRequest(BaseModel):
+    # Sin str_strip_whitespace: los espacios forman parte de la contraseña.
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class MessageResponse(BaseModel):
+    message: str
+
+
+class NotificationPreferences(BaseModel):
+    low_stock: bool = True
+    capacity: bool = True
+    temperature: bool = True
+    offline: bool = True
+    sound: bool = False
+
+
+class NotificationPreferencesUpdate(BaseModel):
+    low_stock: bool
+    capacity: bool
+    temperature: bool
+    offline: bool
+    sound: bool
+
+
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
