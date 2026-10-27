@@ -2,6 +2,7 @@
 import csv
 import io
 import json
+import logging
 import math
 import os
 from dataclasses import dataclass, field
@@ -13,6 +14,24 @@ from uuid import UUID
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
+
+log = logging.getLogger(__name__)
+
+
+def provider_error(result):
+    message = ''
+    try:
+        payload = result.json()
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        message = payload.get('error') or ''
+        results = payload.get('results')
+        if not message and isinstance(results, list) and results and isinstance(results[0], dict):
+            message = results[0].get('error') or ''
+    if not message:
+        message = result.text or ''
+    return ' '.join(str(message).split())[:300]
 
 
 @dataclass(frozen=True)
@@ -139,6 +158,7 @@ def parse_influxql(data):
 
 def read_temperature(settings, branch_id):
     headers = {'Authorization': 'Token ' + settings.token}
+    result = None
     try:
         with httpx.Client(timeout=settings.timeout_seconds, follow_redirects=False) as client:
             if settings.version == '2':
@@ -153,8 +173,11 @@ def read_temperature(settings, branch_id):
                 result = client.get(settings.url + '/query', params=params,
                                     headers={**headers, 'Accept': 'application/json'})
             if result.status_code in {401, 403}:
+                log.warning('InfluxDB rechazó el token de lectura (HTTP %s): %s',
+                            result.status_code, provider_error(result))
                 raise HTTPException(503, 'Revisa el token de lectura y sus permisos en InfluxDB')
             if result.status_code == 429:
+                log.warning('InfluxDB limitó las consultas (HTTP 429): %s', provider_error(result))
                 raise HTTPException(503, 'InfluxDB alcanzó su límite de consultas; intenta más tarde')
             result.raise_for_status()
             point = parse_flux(result.text) if settings.version == '2' else parse_influxql(result.json())
@@ -164,9 +187,15 @@ def read_temperature(settings, branch_id):
         if point and (not math.isfinite(temperature) or measured_at.tzinfo is None or measured_at > now):
             raise ValueError('Invalid temperature or timestamp')
     except httpx.TimeoutException:
+        log.warning('InfluxDB no respondió en %s s', settings.timeout_seconds)
         raise HTTPException(504, 'InfluxDB tardó demasiado en responder') from None
-    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError, OverflowError, csv.Error):
-        # No devolver cuerpos/URLs del proveedor: pueden contener datos internos.
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError, OverflowError, csv.Error) as exc:
+        if result is not None:
+            log.warning('InfluxDB respondió HTTP %s (db=%r rp=%r measurement=%r field=%r): %s',
+                        result.status_code, settings.database, settings.retention_policy,
+                        settings.measurement, settings.temperature_field, provider_error(result))
+        else:
+            log.warning('No se pudo conectar a InfluxDB (%s)', type(exc).__name__)
         raise HTTPException(502, 'No se pudo consultar InfluxDB; revisa versión, esquema y configuración') from None
     age = max(0, int((now - measured_at).total_seconds())) if measured_at else None
     return TemperatureResponse(branch_id=branch_id, temperature_c=temperature, measured_at=measured_at,
