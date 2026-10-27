@@ -27,11 +27,31 @@ class UserResponse(BaseModel):
     email: str = Field(min_length=3, max_length=320, pattern=EMAIL_PATTERN)
     first_name: str
     last_name: str
+    phone_number: str | None = None
     is_superuser: bool
     account_status: str
     role: str
     organization_id: str
     branch_id: str | None = None
+
+
+class ProfileUpdateRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    first_name: str | None = Field(default=None, min_length=1, max_length=100)
+    last_name: str | None = Field(default=None, min_length=1, max_length=100)
+    email: str | None = Field(default=None, min_length=3, max_length=320, pattern=EMAIL_PATTERN)
+    phone_number: str | None = Field(default=None, max_length=30)
+
+
+class PasswordChangeRequest(BaseModel):
+    # Sin str_strip_whitespace: los espacios forman parte de la contraseña.
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class MessageResponse(BaseModel):
+    message: str
 
 
 class LoginResponse(BaseModel):

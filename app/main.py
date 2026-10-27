@@ -12,7 +12,8 @@ from .node_registration import make_router as node_router
 from .telemetry import create_router as telemetry_router
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, LoginRequest, LoginResponse,
-                      RegisterRequest, RegisterResponse, UserResponse)
+                      MessageResponse, PasswordChangeRequest, ProfileUpdateRequest, RegisterRequest,
+                      RegisterResponse, UserResponse)
 from .security import (create_access_token, decode_access_token, hash_password,
                        hash_registration_token, verify_password, generate_registration_token)
 
@@ -38,7 +39,8 @@ bearer = HTTPBearer(auto_error=False)
 def user_response(user):
     state = 'PENDING_APPROVAL' if user['account_status']=='pending' else user['account_status'].upper()
     return UserResponse(id=str(user['id']), email=user['email'], first_name=user['first_name'],
-        last_name=user['last_name'], is_superuser=user['role'].lower() == 'sudo', account_status=state,
+        last_name=user['last_name'], phone_number=user['phone_number'],
+        is_superuser=user['role'].lower() == 'sudo', account_status=state,
         role=user['role'], organization_id=str(user['organization_id']),
         branch_id=str(user['branch_id']) if user['branch_id'] else None)
 
@@ -96,6 +98,40 @@ def current_user(credentials: HTTPAuthorizationCredentials=Depends(bearer)):
 @app.get('/auth/me',response_model=UserResponse)
 def me(user=Depends(current_user)):
     return user_response(user)
+
+PROFILE_FIELDS={'first_name':'El nombre','last_name':'El apellido','email':'El correo'}
+
+@app.patch('/auth/me',response_model=UserResponse)
+def update_me(request:ProfileUpdateRequest,user=Depends(current_user)):
+    changes=request.model_dump(exclude_unset=True)
+    for field,label in PROFILE_FIELDS.items():
+        if field in changes and changes[field] is None:
+            raise HTTPException(422,f'{label} no puede estar vacío')
+    if 'email' in changes:changes['email']=changes['email'].lower()
+    if 'phone_number' in changes:changes['phone_number']=changes['phone_number'] or None
+    if not changes:return user_response(user)
+    assignments=', '.join(f'{field}=%s' for field in changes)
+    try:
+        with db.get_connection() as connection:
+            updated=connection.execute(f'UPDATE "user" SET {assignments}, updated_at=NOW() WHERE id=%s RETURNING *',
+                (*changes.values(),user['id'])).fetchone()
+            connection.commit()
+    except UniqueViolation:
+        raise HTTPException(409,'El correo ya está registrado')
+    if not updated:raise HTTPException(404,'Usuario no encontrado')
+    return user_response(updated)
+
+@app.post('/auth/change-password',response_model=MessageResponse)
+def change_password(request:PasswordChangeRequest,user=Depends(current_user)):
+    if not verify_password(request.current_password,user['password_hash']):
+        raise HTTPException(400,'La contraseña actual no es correcta')
+    if request.new_password==request.current_password:
+        raise HTTPException(400,'La nueva contraseña debe ser distinta de la actual')
+    with db.get_connection() as connection:
+        connection.execute('UPDATE "user" SET password_hash=%s, updated_at=NOW() WHERE id=%s',
+            (hash_password(request.new_password),user['id']))
+        connection.commit()
+    return MessageResponse(message='Contraseña actualizada')
 
 @app.post('/branches',response_model=BranchCreatedResponse,status_code=201)
 def create_branch(request: BranchCreateRequest,response:Response,creator=Depends(current_user)):
