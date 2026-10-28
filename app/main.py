@@ -12,8 +12,9 @@ from .node_registration import make_router as node_router
 from .telemetry import create_router as telemetry_router
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, LoginRequest, LoginResponse,
-                      MessageResponse, PasswordChangeRequest, ProfileUpdateRequest, RegisterRequest,
-                      RegisterResponse, UserResponse)
+                      MessageResponse, NotificationPreferences, NotificationPreferencesUpdate,
+                      PasswordChangeRequest, ProfileUpdateRequest, RegisterRequest, RegisterResponse,
+                      UserResponse)
 from .security import (create_access_token, decode_access_token, hash_password,
                        hash_registration_token, verify_password, generate_registration_token)
 
@@ -98,40 +99,6 @@ def current_user(credentials: HTTPAuthorizationCredentials=Depends(bearer)):
 @app.get('/auth/me',response_model=UserResponse)
 def me(user=Depends(current_user)):
     return user_response(user)
-
-PROFILE_FIELDS={'first_name':'El nombre','last_name':'El apellido','email':'El correo'}
-
-@app.patch('/auth/me',response_model=UserResponse)
-def update_me(request:ProfileUpdateRequest,user=Depends(current_user)):
-    changes=request.model_dump(exclude_unset=True)
-    for field,label in PROFILE_FIELDS.items():
-        if field in changes and changes[field] is None:
-            raise HTTPException(422,f'{label} no puede estar vacío')
-    if 'email' in changes:changes['email']=changes['email'].lower()
-    if 'phone_number' in changes:changes['phone_number']=changes['phone_number'] or None
-    if not changes:return user_response(user)
-    assignments=', '.join(f'{field}=%s' for field in changes)
-    try:
-        with db.get_connection() as connection:
-            updated=connection.execute(f'UPDATE "user" SET {assignments}, updated_at=NOW() WHERE id=%s RETURNING *',
-                (*changes.values(),user['id'])).fetchone()
-            connection.commit()
-    except UniqueViolation:
-        raise HTTPException(409,'El correo ya está registrado')
-    if not updated:raise HTTPException(404,'Usuario no encontrado')
-    return user_response(updated)
-
-@app.post('/auth/change-password',response_model=MessageResponse)
-def change_password(request:PasswordChangeRequest,user=Depends(current_user)):
-    if not verify_password(request.current_password,user['password_hash']):
-        raise HTTPException(400,'La contraseña actual no es correcta')
-    if request.new_password==request.current_password:
-        raise HTTPException(400,'La nueva contraseña debe ser distinta de la actual')
-    with db.get_connection() as connection:
-        connection.execute('UPDATE "user" SET password_hash=%s, updated_at=NOW() WHERE id=%s',
-            (hash_password(request.new_password),user['id']))
-        connection.commit()
-    return MessageResponse(message='Contraseña actualizada')
 
 PROFILE_FIELDS={'first_name':'El nombre','last_name':'El apellido','email':'El correo'}
 
