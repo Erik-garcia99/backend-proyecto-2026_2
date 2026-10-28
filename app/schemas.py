@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -110,6 +112,19 @@ class BranchCreatedResponse(BranchResponse):
 class BusinessTokenResponse(BaseModel):
     business_id: str
     business_token: str
+
+
+class PendingUserResponse(BaseModel):
+    id: str
+    email: str = Field(min_length=3, max_length=320, pattern=EMAIL_PATTERN)
+    first_name: str
+    last_name: str
+    phone_number: str | None = None
+    role: str
+    account_status: str
+    organization_id: str
+    branch_id: str | None = None
+    created_at: datetime
 
 
 class BranchTokenResponse(BaseModel):

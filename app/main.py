@@ -13,8 +13,8 @@ from .telemetry import create_router as telemetry_router
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, LoginRequest, LoginResponse,
                       MessageResponse, NotificationPreferences, NotificationPreferencesUpdate,
-                      PasswordChangeRequest, ProfileUpdateRequest, RegisterRequest, RegisterResponse,
-                      UserResponse)
+                      PasswordChangeRequest, PendingUserResponse, ProfileUpdateRequest, RegisterRequest,
+                      RegisterResponse, UserResponse)
 from .security import (create_access_token, decode_access_token, hash_password,
                        hash_registration_token, verify_password, generate_registration_token)
 
@@ -134,6 +134,45 @@ def change_password(request:PasswordChangeRequest,user=Depends(current_user)):
         connection.commit()
     return MessageResponse(message='Contraseña actualizada')
 
+ORG_WIDE_ROLES = {'owner', 'gerencia'}
+
+@app.get('/auth/pending', response_model=list[PendingUserResponse])
+def pending_users(user=Depends(current_user)):
+    role = user['role'].lower()
+    if not (user['is_superuser'] or role in {'owner', 'rh'}):
+        raise HTTPException(403, 'No tienes permisos para aprobar usuarios')
+    with db.get_connection() as connection:
+        if user['is_superuser']:
+            rows = connection.execute('''SELECT * FROM "user" WHERE account_status='pending' AND deactivated_at IS NULL
+                ORDER BY created_at DESC''').fetchall()
+        elif role in ORG_WIDE_ROLES:
+            rows = connection.execute('''SELECT * FROM "user" WHERE account_status='pending' AND deactivated_at IS NULL
+                AND organization_id=%s ORDER BY created_at DESC''', (user['organization_id'],)).fetchall()
+        else:
+            rows = connection.execute('''SELECT * FROM "user" WHERE account_status='pending' AND deactivated_at IS NULL
+                AND organization_id=%s AND branch_id=%s ORDER BY created_at DESC''',
+                (user['organization_id'], user['branch_id'])).fetchall()
+    return [PendingUserResponse(id=str(r['id']), email=r['email'], first_name=r['first_name'],
+        last_name=r['last_name'], phone_number=r['phone_number'], role=r['role'],
+        account_status=r['account_status'], organization_id=str(r['organization_id']),
+        branch_id=str(r['branch_id']) if r['branch_id'] else None, created_at=r['created_at'])
+        for r in rows]
+
+@app.post('/auth/reject/{user_id}', response_model=MessageResponse)
+def reject_user(user_id: UUID, approver=Depends(current_user)):
+    if not (approver['is_superuser'] or approver['role'].lower() in {'owner', 'rh'}):
+        raise HTTPException(403, 'No tienes permisos para rechazar usuarios')
+    with db.get_connection() as connection:
+        target = connection.execute('''SELECT * FROM "user" WHERE id=%s AND account_status='pending'
+            AND deactivated_at IS NULL FOR UPDATE''', (user_id,)).fetchone()
+        if not target:
+            raise HTTPException(404, 'Cuenta pendiente no encontrada')
+        require_branch_access(approver, target['branch_id'], target['organization_id'])
+        connection.execute('''UPDATE "user" SET account_status='rejected', deactivated_at=NOW(),
+            updated_at=NOW() WHERE id=%s''', (user_id,))
+        connection.commit()
+    return MessageResponse(message='Cuenta rechazada')
+
 @app.get('/auth/me/preferences',response_model=NotificationPreferences)
 def get_preferences(user=Depends(current_user)):
     with db.get_connection() as connection:
@@ -181,6 +220,8 @@ def create_branch(request: BranchCreateRequest,response:Response,creator=Depends
 
 @app.post('/auth/approve/{user_id}',response_model=UserResponse)
 def approve_user(user_id:UUID,approver=Depends(current_user)):
+    if not (approver['is_superuser'] or approver['role'].lower() in {'owner', 'rh'}):
+        raise HTTPException(403, 'No tienes permisos para aprobar usuarios')
     with db.get_connection() as connection:
         target=connection.execute('SELECT * FROM "user" WHERE id=%s AND account_status=\'pending\' AND deactivated_at IS NULL FOR UPDATE',(user_id,)).fetchone()
         if not target:raise HTTPException(404,'Cuenta pendiente no encontrada')

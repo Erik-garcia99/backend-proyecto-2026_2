@@ -204,8 +204,9 @@ def read_temperature(settings, branch_id):
 
 
 def can_read_branch(user, branch):
+    role = user['role'].lower()
     return (user['is_superuser'] or (user['organization_id'] == branch['organization_id']
-            and (user['role'].lower() == 'owner' or user['branch_id'] == branch['id'])))
+            and (role in {'owner', 'gerencia'} or user['branch_id'] == branch['id'])))
 
 
 def create_router(current_user, get_connection):
@@ -218,7 +219,7 @@ def create_router(current_user, get_connection):
                 JOIN organization o ON o.id=b.organization_id
                 WHERE b.is_active AND o.is_active AND (%s OR (b.organization_id=%s
                     AND (%s OR b.id=%s))) ORDER BY b.name,b.id''',
-                (user['is_superuser'], user['organization_id'], user['role'].lower() == 'owner',
+                (user['is_superuser'], user['organization_id'], user['role'].lower() in {'owner', 'gerencia'},
                  user['branch_id'])).fetchall()
         response.headers['Cache-Control'] = 'no-store'
         return [{'id': str(row['id']), 'name': row['name']} for row in rows]

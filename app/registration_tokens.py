@@ -7,7 +7,7 @@ from .security import generate_registration_token, hash_registration_token
 def require_branch_access(user, branch_id, organization_id):
     role=user['role'].lower()
     if user['is_superuser']:return
-    if user['organization_id']==organization_id and (role=='owner' or (role=='manager' and user['branch_id']==branch_id)):
+    if user['organization_id']==organization_id and (role in {'owner','gerencia'} or (role in {'manager','rh'} and user['branch_id']==branch_id)):
         return
     raise HTTPException(403,'No tienes permisos sobre esta sucursal')
 
