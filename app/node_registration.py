@@ -16,6 +16,12 @@ log = logging.getLogger('selfiq.nodes')
 
 MAC_RE = re.compile(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$')
 NODE_TYPES = {'guide', 'access_counter', 'shelf_cam', 'environment'}
+# Alias que pueden enviar firmware antiguos o etiquetas de la API del panel.
+NODE_TYPE_ALIASES = {
+    'shelf_guide': 'guide',
+    'occupancy': 'access_counter',
+    'camera': 'shelf_cam',
+}
 
 
 class RegisterNode(BaseModel):
@@ -37,7 +43,10 @@ def make_router(get_connection, hub, current_user):
     @router.post('/gateways/{gateway_id}/nodes/register')
     def register_node(gateway_id: str, body: RegisterNode):
         # RPi signs each REST request with the private key already used for WSS.
-        if not MAC_RE.fullmatch(body.mac_address) or body.node_type not in NODE_TYPES:
+        # La firma cubre el tipo tal como lo envió la RPi; el alias se resuelve
+        # después de verificarla para no aceptar firmas sobre un tipo inventado.
+        node_type = NODE_TYPE_ALIASES.get(body.node_type, body.node_type)
+        if not MAC_RE.fullmatch(body.mac_address) or node_type not in NODE_TYPES:
             raise HTTPException(422, 'MAC o tipo de nodo incorrecto')
         if abs(time.time() - body.timestamp) > 120:
             raise HTTPException(401, 'Firma expirada; compruebe NTP en la Raspberry')
@@ -68,25 +77,28 @@ def make_router(get_connection, hub, current_user):
             # La unicidad de mac_address serializa altas concurrentes incluso con varios workers.
             with conn.cursor() as cur:
                 cur.execute('''INSERT INTO esp32_node
-                     (gateway_id,node_type,mac_address,registration_status,registered_at)
-                     VALUES (%s,%s,%s,'registered',NOW())
+                     (gateway_id,node_type,mac_address,registration_status,registered_at,
+                      is_online,last_heartbeat_at)
+                     VALUES (%s,%s,%s,'registered',NOW(),TRUE,NOW())
                      ON CONFLICT (mac_address) DO NOTHING RETURNING id,gateway_id,node_type''',
-                    (gateway['id'], body.node_type, body.mac_address))
+                    (gateway['id'], node_type, body.mac_address))
                 inserted = cur.fetchone()
                 row = inserted or cur.execute('''SELECT id,gateway_id,node_type,registration_status
                      FROM esp32_node WHERE mac_address=%s FOR UPDATE''',
                      (body.mac_address,)).fetchone()
-                if not row or row['gateway_id'] != gateway['id'] or row['node_type'] != body.node_type:
+                if (not row or row['gateway_id'] != gateway['id']
+                        or NODE_TYPE_ALIASES.get(row['node_type'], row['node_type']) != node_type):
                     raise HTTPException(409, 'MAC ya registrada para otro gateway o tipo de módulo')
                 if not inserted:
                     cur.execute('''UPDATE esp32_node SET registration_status='registered',
-                         registered_at=COALESCE(registered_at,NOW()),updated_at=NOW()
+                         registered_at=COALESCE(registered_at,NOW()),is_online=TRUE,
+                         last_heartbeat_at=NOW(),updated_at=NOW()
                          WHERE id=%s''', (row['id'],))
             conn.commit()
         log.info('ESP32 registrada: MAC=%s ID=%s sucursal=%s existente=%s',
                  body.mac_address, row['id'], gateway['branch_id'], not bool(inserted))
         return {'mac_address': body.mac_address, 'esp_id': str(row['id']),
-                'branch_id': str(gateway['branch_id']), 'node_type': body.node_type,
+                'branch_id': str(gateway['branch_id']), 'node_type': node_type,
                 'registration_status': 'registered', 'already_registered': not bool(inserted)}
 
     @router.get('/branches/{branch_id}/nodes')

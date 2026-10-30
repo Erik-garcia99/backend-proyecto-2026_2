@@ -105,7 +105,7 @@ class GatewayHub:
                 if not future.done():
                     future.set_result(None)
 
-    async def send(self, identifier, command, branch_token=None):
+    async def send(self, identifier, command, branch_token=None, payload=None):
         session = self.sessions.get(identifier)
         if session is None:
             raise HTTPException(503, 'Raspberry desconectada; la orden no se encola')
@@ -130,6 +130,8 @@ class GatewayHub:
                 message = {'type': 'command', 'id': message_id, 'command': command}
                 if command == 'gateway.token':
                     message['branch_token'] = branch_token
+                elif isinstance(payload, dict):
+                    message.update(payload)
                 await session['ws'].send_json(message)
             response = await asyncio.wait_for(future, self.timeout)
             if response is None:
@@ -191,6 +193,7 @@ def create_router(hub, current_user, get_connection):
         token_valid = bool(valid) and (session is None or session['authorized'])
         status = ('registered' if token_valid else 'token_invalid') if gateway['device_public_key'] else 'not_enrolled'
         return {'gateway_id': gateway_id, 'branch_id': str(gateway['branch_id']),
+                'name': gateway.get('hostname') or gateway_id,
                 'connected': session is not None and token_valid,
                 'recovery_available': session is not None,
                 'registration_status': status,
