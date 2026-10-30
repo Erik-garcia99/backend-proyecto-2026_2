@@ -5,7 +5,7 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from .security_tokens import token_hash
 from .gateway_registry import enroll, verify_proof, active_token
 import secrets
@@ -17,6 +17,11 @@ class GatewayCommand(BaseModel):
 
 class GatewayTokenRequest(BaseModel):
     branch_token: str
+
+
+class GatewayNameRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=120)
 
 
 class GatewayHub:
@@ -193,7 +198,7 @@ def create_router(hub, current_user, get_connection):
         token_valid = bool(valid) and (session is None or session['authorized'])
         status = ('registered' if token_valid else 'token_invalid') if gateway['device_public_key'] else 'not_enrolled'
         return {'gateway_id': gateway_id, 'branch_id': str(gateway['branch_id']),
-                'name': gateway.get('hostname') or gateway_id,
+                'name': gateway.get('display_name') or 'Gateway',
                 'connected': session is not None and token_valid,
                 'recovery_available': session is not None,
                 'registration_status': status,
@@ -218,6 +223,14 @@ def create_router(hub, current_user, get_connection):
     @router.get('/gateways/{gateway_id}')
     def state(gateway_id: str, gateway=Depends(authorized)):
         return gateway_state(gateway_id, gateway)
+
+    @router.patch('/gateways/{gateway_id}')
+    def rename(gateway_id: str, body: GatewayNameRequest, gateway=Depends(authorized)):
+        with get_connection() as connection:
+            row = connection.execute('''UPDATE gateway SET display_name=%s, updated_at=NOW()
+                WHERE id=%s RETURNING *''', (body.name, gateway['id'])).fetchone()
+            connection.commit()
+        return gateway_state(gateway_id, row)
 
     @router.post('/gateways/{gateway_id}/token')
     async def replace_token(gateway_id: str, body: GatewayTokenRequest, gateway=Depends(authorized)):

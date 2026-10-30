@@ -221,7 +221,8 @@ def create_router(current_user, get_connection, hub):
         return gateway
 
     @router.get('/branches/{branch_id}/devices')
-    def list_devices(branch_id: UUID, response: Response, user=Depends(current_user)):
+    def list_devices(branch_id: UUID, response: Response, gateway_id: str | None = None,
+                     user=Depends(current_user)):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
             rows = connection.execute(
@@ -229,9 +230,10 @@ def create_router(current_user, get_connection, hub):
                    JOIN gateway g ON g.id=n.gateway_id
                    JOIN branch b ON b.id=g.branch_id
                    JOIN organization o ON o.id=b.organization_id
-                   WHERE g.branch_id=%s AND g.is_active AND b.is_active AND o.is_active
-                   ORDER BY n.created_at''',
-                (branch_id,)).fetchall()
+                    WHERE g.branch_id=%s AND g.is_active AND b.is_active AND o.is_active
+                      AND (%s::text IS NULL OR g.rpi_identifier=%s)
+                    ORDER BY n.created_at''',
+                (branch_id, gateway_id, gateway_id)).fetchall()
         response.headers['Cache-Control'] = 'no-store'
         return [serialize_device(row) for row in rows]
 
