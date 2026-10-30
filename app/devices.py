@@ -302,10 +302,19 @@ def create_router(current_user, get_connection, hub):
         return serialize_device(updated)
 
     @router.delete('/branches/{branch_id}/devices/{device_id}')
-    def delete_device(branch_id: UUID, device_id: UUID, response: Response, user=Depends(current_user)):
+    async def delete_device(branch_id: UUID, device_id: UUID, response: Response, user=Depends(current_user)):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
-            node = load_node(connection, branch_id, device_id, lock=True)
+            node = load_node(connection, branch_id, device_id)
+        result = await hub.send(node['rpi_identifier'], 'node.reset', payload={
+            'node_id': str(device_id), 'branch_id': str(branch_id)})
+        data = (result or {}).get('data') or {}
+        if (not result or result.get('ok') is not True or not isinstance(data, dict)
+                or data.get('identity_reset') is not True or data.get('node_id') != str(device_id)):
+            raise HTTPException(502, (result or {}).get('error') or
+                                'El nodo no confirmó el borrado de identidad. Puedes reintentar.')
+        with get_connection() as connection:
+            require_branch(connection, branch_id, user)
             connection.execute('DELETE FROM esp32_node WHERE id=%s', (device_id,))
             connection.commit()
         response.headers['Cache-Control'] = 'no-store'

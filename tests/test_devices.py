@@ -2,7 +2,7 @@ import time
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID
 
 from fastapi import FastAPI
@@ -86,3 +86,29 @@ class ExpiryTests(unittest.IsolatedAsyncioTestCase):
         hub = SimpleNamespace(send=AsyncMock())
         await devices.expire_discovery({'stopped': True, 'expires_at': 0}, hub)
         hub.send.assert_not_called()
+
+
+class DeleteTests(unittest.TestCase):
+    def test_deletes_only_after_exact_node_confirmation(self):
+        node_id = OTHER
+        for result, expected in [({'ok': True, 'data': {'published': True}}, 502),
+                                 ({'ok': False, 'error': 'Sin respuesta del nodo'}, 502),
+                                 ({'ok': True, 'data': {'identity_reset': True, 'node_id': 'otro'}}, 502),
+                                 ({'ok': True, 'data': {'identity_reset': True, 'node_id': str(node_id)}}, 200)]:
+            with self.subTest(result=result):
+                connection = Mock()
+                @contextmanager
+                def connect():
+                    yield connection
+                hub = SimpleNamespace(send=AsyncMock(return_value=result))
+                app = FastAPI()
+                app.include_router(devices.create_router(lambda: {}, connect, hub))
+                with patch.object(devices, 'require_branch'), patch.object(devices, 'load_node',
+                        return_value={'rpi_identifier': 'rpi', 'node_type': 'guide'}), TestClient(app) as client:
+                    response = client.delete(f'/branches/{BRANCH}/devices/{node_id}')
+                self.assertEqual(response.status_code, expected)
+                if expected == 200:
+                    connection.execute.assert_called_once_with('DELETE FROM esp32_node WHERE id=%s', (node_id,))
+                    connection.commit.assert_called_once()
+                else:
+                    connection.execute.assert_not_called()
