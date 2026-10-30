@@ -40,6 +40,12 @@ _expiry_tasks: set[asyncio.Task] = set()
 _starting_gateways: set[str] = set()
 
 
+def pairing_allowed(gateway_id, branch_id):
+    return any(session['gateway_id'] == gateway_id and session['branch_id'] == branch_id
+               and not session.get('stopped') and time.time() < session['expires_at']
+               for session in _discoveries.values())
+
+
 async def close_discoveries():
     tasks = tuple(_expiry_tasks)
     for task in tasks:
@@ -224,8 +230,6 @@ def create_router(current_user, get_connection, hub):
                    JOIN branch b ON b.id=g.branch_id
                    JOIN organization o ON o.id=b.organization_id
                    WHERE g.branch_id=%s AND g.is_active AND b.is_active AND o.is_active
-                     AND (n.node_code IS NOT NULL
-                          OR NULLIF(btrim(COALESCE(n.name, '')), '') IS NOT NULL)
                    ORDER BY n.created_at''',
                 (branch_id,)).fetchall()
         response.headers['Cache-Control'] = 'no-store'

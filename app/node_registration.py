@@ -76,6 +76,12 @@ def make_router(get_connection, hub, current_user):
 
             # La unicidad de mac_address serializa altas concurrentes incluso con varios workers.
             with conn.cursor() as cur:
+                known = cur.execute('SELECT id FROM esp32_node WHERE mac_address=%s',
+                                    (body.mac_address,)).fetchone()
+                if not known:
+                    from .devices import pairing_allowed
+                    if not pairing_allowed(gateway_id, gateway['branch_id']):
+                        raise HTTPException(409, 'Inicia Agregar dispositivo desde la app para registrar un ESP32 nuevo')
                 cur.execute('''INSERT INTO esp32_node
                      (gateway_id,node_type,mac_address,registration_status,registered_at,
                       is_online,last_heartbeat_at)

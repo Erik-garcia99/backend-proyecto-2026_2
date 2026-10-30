@@ -65,6 +65,16 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIn('search', devices._discoveries)
         self.hub.send.assert_not_called()
 
+    def test_new_node_requires_active_search_in_same_gateway_and_branch(self):
+        self.assertTrue(devices.pairing_allowed('rpi', BRANCH))
+        self.assertFalse(devices.pairing_allowed('other-rpi', BRANCH))
+        self.assertFalse(devices.pairing_allowed('rpi', OTHER))
+        self.session['expires_at'] = time.time() - 1
+        self.assertFalse(devices.pairing_allowed('rpi', BRANCH))
+        self.session['expires_at'] = time.time() + 120
+        self.session['stopped'] = True
+        self.assertFalse(devices.pairing_allowed('rpi', BRANCH))
+
 
 class ExpiryTests(unittest.IsolatedAsyncioTestCase):
     async def test_expiry_closes_ap_without_polling(self):
