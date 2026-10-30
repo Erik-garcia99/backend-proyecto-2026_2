@@ -1,5 +1,8 @@
 # Temperatura: ESP32 → Raspberry → InfluxDB Cloud → API → app
 
+> Aforo del radar LD2450: ver [`TELEMETRIA_AFORO.md`](TELEMETRIA_AFORO.md).
+> Comparte el mismo flujo RPI → InfluxDB → API, con measurement `occupancy`.
+
 La Raspberry sigue escribiendo como hasta ahora. La API **solo lee** InfluxDB y
 la tarjeta Temperatura de Inicio consulta la API cada 15 s mientras está activa.
 No se modifican firmware, MQTT, registros de nodos ni esquema de PostgreSQL.

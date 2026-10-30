@@ -11,7 +11,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from app.telemetry import (InfluxSettings, can_read_branch, create_router, flux_query,
-                           influxql_query, parse_flux, parse_influxql, read_temperature)
+                           influxql_query, parse_flux, parse_influxql, read_occupancy,
+                           read_temperature)
 
 BRANCH = UUID('11111111-1111-4111-8111-111111111111')
 OTHER_BRANCH = UUID('22222222-2222-4222-8222-222222222222')
@@ -25,7 +26,7 @@ def csv_point(timestamp, value=25.5):
 
 
 class InfluxTests(unittest.TestCase):
-    def read_with_response(self, response, settings=SETTINGS):
+    def read_with_response(self, response, settings=SETTINGS, reader=read_temperature):
         real_client = httpx.Client
         requests = []
 
@@ -37,7 +38,7 @@ class InfluxTests(unittest.TestCase):
 
         client = real_client(transport=httpx.MockTransport(handler))
         with patch('app.telemetry.httpx.Client', return_value=client):
-            result = read_temperature(settings, BRANCH)
+            result = reader(settings, BRANCH)
         return result, requests
 
     def test_recent_temperature_and_flux_request(self):
@@ -88,6 +89,52 @@ class InfluxTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(HTTPException) as raised:
                 self.read_with_response(httpx.Response(200, text=text))
             self.assertEqual(raised.exception.status_code, 502)
+
+    def test_recent_occupancy_and_flux_query(self):
+        timestamp = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+        data, requests = self.read_with_response(
+            httpx.Response(200, text=csv_point(timestamp, 2)), reader=read_occupancy)
+        self.assertEqual(data.occupancy, 2)
+        self.assertEqual(data.status, 'ok')
+        self.assertEqual(data.stale_after_seconds, 20)
+        body = requests[0].content.decode()
+        self.assertIn('"occupancy"', body)
+        self.assertIn('"value"', body)
+        self.assertIn(str(BRANCH), body)
+
+    def test_occupancy_zero_is_valid_and_stale_uses_20_seconds(self):
+        recent = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        data, _ = self.read_with_response(
+            httpx.Response(200, text=csv_point(recent, 0)), reader=read_occupancy)
+        self.assertEqual(data.occupancy, 0)
+        self.assertEqual(data.status, 'ok')
+        old = (datetime.now(timezone.utc) - timedelta(seconds=25)).isoformat()
+        data, _ = self.read_with_response(
+            httpx.Response(200, text=csv_point(old, 1)), reader=read_occupancy)
+        self.assertEqual(data.status, 'stale')
+
+    def test_occupancy_empty_and_invalid_values(self):
+        data, _ = self.read_with_response(httpx.Response(200, text=''), reader=read_occupancy)
+        self.assertEqual(data.status, 'no_data')
+        self.assertIsNone(data.occupancy)
+        timestamp = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        for value in ('-1', '1.5', '101', 'NaN'):
+            with self.subTest(value=value), self.assertRaises(HTTPException) as raised:
+                self.read_with_response(httpx.Response(200, text=csv_point(timestamp, value)),
+                                        reader=read_occupancy)
+            self.assertEqual(raised.exception.status_code, 502)
+
+    def test_occupancy_influxql_uses_own_column(self):
+        timestamp = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        payload = {'results': [{'series': [{'columns': ['time', 'occupancy'],
+                                             'values': [[timestamp, 3]]}]}]}
+        settings = replace(SETTINGS, version='3', database='iot')
+        data, requests = self.read_with_response(httpx.Response(200, json=payload),
+                                                 settings, reader=read_occupancy)
+        self.assertEqual(data.occupancy, 3)
+        query = requests[0].url.params['q']
+        self.assertIn('"occupancy"', query)
+        self.assertIn('FROM "occupancy"', query)
 
     def test_v3_query_and_latest_across_series(self):
         timestamp = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
@@ -163,6 +210,7 @@ class RouterTests(unittest.TestCase):
         app.include_router(create_router(current_user, get_connection))
         self.client = TestClient(app)
         self.path = f'/branches/{BRANCH}/telemetry/temperature/latest'
+        self.occupancy_path = f'/branches/{BRANCH}/telemetry/occupancy/latest'
 
     def test_unauthenticated_and_foreign_branch_never_query_influx(self):
         with patch('app.telemetry.read_temperature') as read:
@@ -178,6 +226,26 @@ class RouterTests(unittest.TestCase):
 
     def test_invalid_uuid(self):
         self.assertEqual(self.client.get('/branches/not-a-uuid/telemetry/temperature/latest').status_code, 422)
+
+    def test_occupancy_requires_branch_access(self):
+        with patch('app.telemetry.read_occupancy') as read:
+            self.user = None
+            self.assertEqual(self.client.get(self.occupancy_path).status_code, 401)
+            self.user = {'is_superuser': False, 'organization_id': ORG,
+                         'branch_id': OTHER_BRANCH, 'role': 'employee'}
+            self.assertEqual(self.client.get(self.occupancy_path).status_code, 403)
+            read.assert_not_called()
+
+    def test_authorized_occupancy_response(self):
+        payload = {'branch_id': BRANCH, 'occupancy': 2,
+                   'measured_at': datetime.now(timezone.utc).isoformat(),
+                   'age_seconds': 1, 'stale_after_seconds': 20, 'status': 'ok'}
+        with patch('app.telemetry.InfluxSettings.from_env', return_value=SETTINGS), \
+                patch('app.telemetry.read_occupancy', return_value=payload):
+            response = self.client.get(self.occupancy_path)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers['Cache-Control'], 'no-store')
+        self.assertEqual(response.json()['occupancy'], 2)
 
     def test_authorized_response_and_no_store(self):
         payload = {'branch_id': BRANCH, 'temperature_c': None, 'measured_at': None,
