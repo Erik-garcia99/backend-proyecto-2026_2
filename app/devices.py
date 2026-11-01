@@ -180,15 +180,16 @@ def _new_discovery_id():
     return uuid4().hex
 
 
-def _discovery_candidates(connection, gateway_id, branch_id):
+def _discovery_candidates(connection, gateway_id, branch_id, started_at):
     rows = connection.execute(
-        '''SELECT n.* FROM esp32_node n
+        '''SELECT n.*, g.rpi_identifier FROM esp32_node n
            JOIN gateway g ON g.id=n.gateway_id
            WHERE g.rpi_identifier=%s AND g.branch_id=%s
              AND n.node_code IS NULL
-             AND NULLIF(btrim(COALESCE(n.name, '')), '') IS NULL
-           ORDER BY n.created_at''',
-        (gateway_id, branch_id)).fetchall()
+              AND NULLIF(btrim(COALESCE(n.name, '')), '') IS NULL
+              AND n.last_heartbeat_at >= %s
+            ORDER BY n.created_at''',
+        (gateway_id, branch_id, datetime.fromtimestamp(started_at, timezone.utc))).fetchall()
     return [serialize_device(row) for row in rows]
 
 
@@ -504,7 +505,7 @@ def create_router(current_user, get_connection, hub):
             raise HTTPException(404, 'Búsqueda no encontrada o expirada')
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
-            devices = _discovery_candidates(connection, session['gateway_id'], branch_id)
+            devices = _discovery_candidates(connection, session['gateway_id'], branch_id, session['started_at'])
         session['gateway_lost'] = session['gateway_id'] not in hub.sessions
         status = _discovery_state(session, devices, time.time())
         response.headers['Cache-Control'] = 'no-store'
