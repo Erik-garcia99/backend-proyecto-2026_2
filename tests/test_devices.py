@@ -75,6 +75,29 @@ class DiscoveryTests(unittest.TestCase):
         self.session['stopped'] = True
         self.assertFalse(devices.pairing_allowed('rpi', BRANCH))
 
+    def test_start_discards_only_never_confirmed_stale_candidates(self):
+        devices._discoveries.clear()
+        executes = []
+
+        def execute(sql, params):
+            executes.append((sql, params))
+            return SimpleNamespace(fetchone=lambda: {'id': BRANCH, 'organization_id': OTHER})
+
+        @contextmanager
+        def connect():
+            yield SimpleNamespace(execute=execute)
+
+        hub = SimpleNamespace(send=AsyncMock(return_value={'ok': True}), sessions={})
+        app = FastAPI()
+        app.include_router(devices.create_router(lambda: self.user, connect, hub))
+        with TestClient(app) as client:
+            response = client.post(f'/branches/{BRANCH}/gateways/rpi/discovery')
+        self.assertEqual(response.status_code, 201)
+        cleanup = [sql for sql, _ in executes if 'DELETE FROM esp32_node' in sql]
+        self.assertEqual(len(cleanup), 1)
+        self.assertIn('node_code IS NULL', cleanup[0])
+        self.assertIn("INTERVAL '7 days'", cleanup[0])
+
 
 class ExpiryTests(unittest.IsolatedAsyncioTestCase):
     async def test_expiry_closes_ap_without_polling(self):

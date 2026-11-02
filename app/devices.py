@@ -211,6 +211,23 @@ def _discovery_state(session, devices, now):
     return 'searching'
 
 
+def _discard_stale_candidates(get_connection, gateway_id, branch_id):
+    """Retira candidatos que nunca se confirmaron y llevan días sin aparecer.
+
+    No toca nodos confirmados (`node_code`) ni candidatos vistos recientemente.
+    Se ejecuta al iniciar una búsqueda para que los registros huérfanos de
+    búsquedas anteriores no se acumulen en «Mis nodos».
+    """
+    with get_connection() as connection:
+        connection.execute(
+            '''DELETE FROM esp32_node n USING gateway g
+               WHERE n.gateway_id=g.id AND g.rpi_identifier=%s AND g.branch_id=%s
+                 AND n.node_code IS NULL
+                 AND (n.last_heartbeat_at IS NULL
+                      OR n.last_heartbeat_at < NOW() - INTERVAL '7 days')''',
+            (gateway_id, branch_id))
+
+
 def create_router(current_user, get_connection, hub):
     router = APIRouter(tags=['Devices'])
 
@@ -495,6 +512,12 @@ def create_router(current_user, get_connection, hub):
                                 f'No se pudo iniciar el emparejamiento: {exc.detail}') from None
         finally:
             _starting_gateways.discard(gateway_id)
+        try:
+            _discard_stale_candidates(get_connection, gateway_id, branch_id)
+        except Exception:
+            # La limpieza es mantenimiento: no debe impedir una búsqueda válida.
+            logging.getLogger(__name__).warning(
+                'No se pudieron retirar candidatos huérfanos', exc_info=True)
         now = time.time()
         discovery_id = _new_discovery_id()
         _discoveries[discovery_id] = {
