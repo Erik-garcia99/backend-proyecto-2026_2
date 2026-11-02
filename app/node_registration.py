@@ -16,6 +16,27 @@ log = logging.getLogger('selfiq.nodes')
 
 MAC_RE = re.compile(r'^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$')
 NODE_TYPES = {'guide', 'access_counter', 'shelf_cam', 'environment'}
+# Alias que pueden enviar firmware antiguos o etiquetas de la API del panel.
+NODE_TYPE_ALIASES = {
+    'shelf_guide': 'guide',
+    'occupancy': 'access_counter',
+    'camera': 'shelf_cam',
+}
+DEFAULT_NODE_NAMES = {
+    'guide': 'Guía de luces',
+    'access_counter': 'Control de aforo',
+    'shelf_cam': 'Cámara',
+    'environment': 'Sensor ambiental',
+}
+
+
+def default_node_name(mac_address, node_type):
+    """Nombre legible y único por nodo; el usuario puede editarlo después.
+
+    Se usa el sufijo de la MAC (``B9:88``) para que dos nodos del mismo tipo no
+    aparezcan con el mismo nombre en el panel. No cambia la identidad técnica.
+    """
+    return f"{DEFAULT_NODE_NAMES.get(node_type, 'Dispositivo')} {mac_address[-5:]}"
 
 
 class RegisterNode(BaseModel):
@@ -26,9 +47,20 @@ class RegisterNode(BaseModel):
     signature: str = Field(min_length=80, max_length=128)
 
 
+class NodeHeartbeat(BaseModel):
+    timestamp: int
+    nonce: str = Field(min_length=16, max_length=64)
+    signature: str = Field(min_length=80, max_length=128)
+
+
 def signed_message(gateway_id, body):
     return ('selfiq-node-register-v1\n' + gateway_id + '\n' + str(body.timestamp)
             + '\n' + body.nonce + '\n' + body.mac_address + '\n' + body.node_type).encode()
+
+
+def heartbeat_message(gateway_id, node_id, body):
+    return ('selfiq-node-heartbeat-v1\n' + gateway_id + '\n' + str(body.timestamp)
+            + '\n' + body.nonce + '\n' + node_id).encode()
 
 
 def make_router(get_connection, hub, current_user):
@@ -37,7 +69,10 @@ def make_router(get_connection, hub, current_user):
     @router.post('/gateways/{gateway_id}/nodes/register')
     def register_node(gateway_id: str, body: RegisterNode):
         # RPi signs each REST request with the private key already used for WSS.
-        if not MAC_RE.fullmatch(body.mac_address) or body.node_type not in NODE_TYPES:
+        # La firma cubre el tipo tal como lo envió la RPi; el alias se resuelve
+        # después de verificarla para no aceptar firmas sobre un tipo inventado.
+        node_type = NODE_TYPE_ALIASES.get(body.node_type, body.node_type)
+        if not MAC_RE.fullmatch(body.mac_address) or node_type not in NODE_TYPES:
             raise HTTPException(422, 'MAC o tipo de nodo incorrecto')
         if abs(time.time() - body.timestamp) > 120:
             raise HTTPException(401, 'Firma expirada; compruebe NTP en la Raspberry')
@@ -67,27 +102,72 @@ def make_router(get_connection, hub, current_user):
 
             # La unicidad de mac_address serializa altas concurrentes incluso con varios workers.
             with conn.cursor() as cur:
+                known = cur.execute('SELECT id FROM esp32_node WHERE mac_address=%s',
+                                    (body.mac_address,)).fetchone()
+                if not known:
+                    from .devices import pairing_allowed
+                    if not pairing_allowed(gateway_id, gateway['branch_id']):
+                        raise HTTPException(409, 'Inicia Agregar dispositivo desde la app para registrar un ESP32 nuevo')
                 cur.execute('''INSERT INTO esp32_node
-                     (gateway_id,node_type,mac_address,registration_status,registered_at)
-                     VALUES (%s,%s,%s,'registered',NOW())
+                     (gateway_id,node_type,mac_address,name,registration_status,registered_at,
+                      is_online,last_heartbeat_at)
+                     VALUES (%s,%s,%s,%s,'registered',NOW(),TRUE,NOW())
                      ON CONFLICT (mac_address) DO NOTHING RETURNING id,gateway_id,node_type''',
-                    (gateway['id'], body.node_type, body.mac_address))
+                    (gateway['id'], node_type, body.mac_address,
+                     default_node_name(body.mac_address, node_type)))
                 inserted = cur.fetchone()
                 row = inserted or cur.execute('''SELECT id,gateway_id,node_type,registration_status
                      FROM esp32_node WHERE mac_address=%s FOR UPDATE''',
                      (body.mac_address,)).fetchone()
-                if not row or row['gateway_id'] != gateway['id'] or row['node_type'] != body.node_type:
+                if (not row or row['gateway_id'] != gateway['id']
+                        or NODE_TYPE_ALIASES.get(row['node_type'], row['node_type']) != node_type):
                     raise HTTPException(409, 'MAC ya registrada para otro gateway o tipo de módulo')
                 if not inserted:
                     cur.execute('''UPDATE esp32_node SET registration_status='registered',
-                         registered_at=COALESCE(registered_at,NOW()),updated_at=NOW()
+                         registered_at=COALESCE(registered_at,NOW()),is_online=TRUE,
+                         last_heartbeat_at=NOW(),updated_at=NOW()
                          WHERE id=%s''', (row['id'],))
             conn.commit()
         log.info('ESP32 registrada: MAC=%s ID=%s sucursal=%s existente=%s',
                  body.mac_address, row['id'], gateway['branch_id'], not bool(inserted))
         return {'mac_address': body.mac_address, 'esp_id': str(row['id']),
-                'branch_id': str(gateway['branch_id']), 'node_type': body.node_type,
+                'branch_id': str(gateway['branch_id']), 'node_type': node_type,
                 'registration_status': 'registered', 'already_registered': not bool(inserted)}
+
+    @router.post('/gateways/{gateway_id}/nodes/{node_id}/heartbeat')
+    def node_heartbeat(gateway_id: str, node_id: UUID, body: NodeHeartbeat):
+        """Presencia real: el gateway reenvía el estado MQTT del nodo, firmado."""
+        if abs(time.time() - body.timestamp) > 120:
+            raise HTTPException(401, 'Firma expirada; compruebe NTP en la Raspberry')
+        try:
+            signature = base64.b64decode(body.signature, validate=True)
+        except (ValueError, TypeError):
+            raise HTTPException(401, 'Firma incorrecta') from None
+        with get_connection() as conn:
+            gateway = conn.execute('''SELECT g.id,g.branch_id,g.device_public_key,
+                       g.registered_with_token,t.token_hash
+                FROM gateway g LEFT JOIN organization_token t ON t.id=g.registered_with_token
+                JOIN branch b ON b.id=g.branch_id JOIN organization o ON o.id=b.organization_id
+                WHERE g.rpi_identifier=%s AND g.is_active AND b.is_active AND o.is_active''',
+                (gateway_id,)).fetchone()
+            if not gateway or not gateway['device_public_key']:
+                raise HTTPException(403, 'Gateway no registrado o desactivado')
+            if not gateway['token_hash'] or not active_token(conn, gateway['token_hash'], gateway['branch_id']):
+                raise HTTPException(403, 'Token de sucursal revocado')
+            try:
+                public_key = base64.b64decode(gateway['device_public_key'], validate=True)
+                Ed25519PublicKey.from_public_bytes(public_key).verify(
+                    signature, heartbeat_message(gateway_id, str(node_id), body))
+            except (ValueError, InvalidSignature):
+                raise HTTPException(401, 'Firma no corresponde al gateway registrado') from None
+            updated = conn.execute('''UPDATE esp32_node SET is_online=TRUE,
+                     last_heartbeat_at=NOW(),updated_at=NOW()
+                     WHERE id=%s AND gateway_id=%s RETURNING id''',
+                (node_id, gateway['id'])).fetchone()
+            if not updated:
+                raise HTTPException(404, 'Nodo no registrado en este gateway')
+            conn.commit()
+        return {'id': str(node_id), 'online': True}
 
     @router.get('/branches/{branch_id}/nodes')
     def list_nodes(branch_id: UUID, user=Depends(current_user)):
