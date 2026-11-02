@@ -127,27 +127,31 @@ def load_node(connection, branch_id: UUID, device_id: UUID, *, node_type=None, l
 
 
 def device_online(node):
-    # Un alta no demuestra conexión permanente; el firmware básico no envía
-    # todavía latidos periódicos al backend.
+    # La presencia real llega por el heartbeats MQTT reenviado por el gateway.
     last_seen = node.get('last_heartbeat_at')
-    if not last_seen or (datetime.now(timezone.utc) - last_seen).total_seconds() > 120:
+    if not last_seen:
         return None
+    if (datetime.now(timezone.utc) - last_seen).total_seconds() > 120:
+        return False
     return bool(node.get('is_online'))
 
 
 def serialize_device(node):
     node_type = node['node_type']
     api_type = NODE_TYPE_TO_API.get(node_type, node_type)
-    name = node.get('name') or {
-        'guide': 'Guía de luces',
-        'occupancy': 'Control de aforo',
-        'camera': 'Cámara',
-    }.get(api_type, 'Dispositivo')
     display_code = node.get('node_code') or (node.get('mac_address') or '')[-5:]
+    default_name = {
+        'guide': 'Guía de luces',
+        'access_counter': 'Control de aforo',
+        'shelf_cam': 'Cámara',
+        'environment': 'Sensor ambiental',
+    }.get(node_type, 'Dispositivo')
     return {
         'id': str(node['id']),
         'type': api_type,
-        'name': name,
+        # El alta asigna "Guía de luces B9:88". Este respaldo cubre registros
+        # antiguos sin nombre; el usuario puede editar `name` en cualquier caso.
+        'name': node.get('name') or f'{default_name} {display_code}',
         'location': node.get('location'),
         'online': device_online(node),
         'lastSeenAt': iso(node.get('last_heartbeat_at') or node.get('registered_at')),
@@ -181,12 +185,13 @@ def _new_discovery_id():
 
 
 def _discovery_candidates(connection, gateway_id, branch_id, started_at):
+    # Candidato = nodo que todavía no fue confirmado por el usuario. El nombre
+    # por defecto no lo excluye; node_code se asigna justo al confirmar el alta.
     rows = connection.execute(
         '''SELECT n.*, g.rpi_identifier FROM esp32_node n
            JOIN gateway g ON g.id=n.gateway_id
            WHERE g.rpi_identifier=%s AND g.branch_id=%s
              AND n.node_code IS NULL
-              AND NULLIF(btrim(COALESCE(n.name, '')), '') IS NULL
               AND n.last_heartbeat_at >= %s
             ORDER BY n.created_at''',
         (gateway_id, branch_id, datetime.fromtimestamp(started_at, timezone.utc))).fetchall()
@@ -303,17 +308,28 @@ def create_router(current_user, get_connection, hub):
         return serialize_device(updated)
 
     @router.delete('/branches/{branch_id}/devices/{device_id}')
-    async def delete_device(branch_id: UUID, device_id: UUID, response: Response, user=Depends(current_user)):
+    async def delete_device(branch_id: UUID, device_id: UUID, response: Response,
+                            force: bool = False, user=Depends(current_user)):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
             node = load_node(connection, branch_id, device_id)
-        result = await hub.send(node['rpi_identifier'], 'node.reset', payload={
-            'node_id': str(device_id), 'branch_id': str(branch_id)})
-        data = (result or {}).get('data') or {}
-        if (not result or result.get('ok') is not True or not isinstance(data, dict)
-                or data.get('identity_reset') is not True or data.get('node_id') != str(device_id)):
-            raise HTTPException(502, (result or {}).get('error') or
-                                'El nodo no confirmó el borrado de identidad. Puedes reintentar.')
+        reset_error = ''
+        if not force:
+            try:
+                result = await hub.send(node['rpi_identifier'], 'node.reset', payload={
+                    'node_id': str(device_id), 'branch_id': str(branch_id)})
+                data = (result or {}).get('data') or {}
+                if (not result or result.get('ok') is not True or not isinstance(data, dict)
+                        or data.get('identity_reset') is not True
+                        or data.get('node_id') != str(device_id)):
+                    reset_error = (result or {}).get('error') or 'El nodo no confirmó el borrado'
+            except HTTPException as exc:
+                reset_error = exc.detail
+            if reset_error:
+                raise HTTPException(
+                    409, f'No se pudo borrar la identidad del nodo: {reset_error}. '
+                         'Actualiza el servicio del gateway si no reconoce la orden. '
+                         'También puedes retirar solo el registro si el equipo no está disponible.')
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
             connection.execute('DELETE FROM esp32_node WHERE id=%s', (device_id,))

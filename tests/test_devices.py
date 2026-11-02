@@ -91,9 +91,9 @@ class ExpiryTests(unittest.IsolatedAsyncioTestCase):
 class DeleteTests(unittest.TestCase):
     def test_deletes_only_after_exact_node_confirmation(self):
         node_id = OTHER
-        for result, expected in [({'ok': True, 'data': {'published': True}}, 502),
-                                 ({'ok': False, 'error': 'Sin respuesta del nodo'}, 502),
-                                 ({'ok': True, 'data': {'identity_reset': True, 'node_id': 'otro'}}, 502),
+        for result, expected in [({'ok': True, 'data': {'published': True}}, 409),
+                                 ({'ok': False, 'error': 'Sin respuesta del nodo'}, 409),
+                                 ({'ok': True, 'data': {'identity_reset': True, 'node_id': 'otro'}}, 409),
                                  ({'ok': True, 'data': {'identity_reset': True, 'node_id': str(node_id)}}, 200)]:
             with self.subTest(result=result):
                 connection = Mock()
@@ -112,3 +112,35 @@ class DeleteTests(unittest.TestCase):
                     connection.commit.assert_called_once()
                 else:
                     connection.execute.assert_not_called()
+
+    def test_force_removes_absent_node_without_contacting_it(self):
+        node_id = OTHER
+        connection = Mock()
+        @contextmanager
+        def connect():
+            yield connection
+        hub = SimpleNamespace(send=AsyncMock(side_effect=AssertionError('no debe contactar al nodo')))
+        app = FastAPI()
+        app.include_router(devices.create_router(lambda: {}, connect, hub))
+        with patch.object(devices, 'require_branch'), patch.object(devices, 'load_node',
+                return_value={'rpi_identifier': 'rpi', 'node_type': 'guide'}), TestClient(app) as client:
+            response = client.delete(f'/branches/{BRANCH}/devices/{node_id}?force=true')
+        self.assertEqual(response.status_code, 200)
+        connection.execute.assert_called_once_with('DELETE FROM esp32_node WHERE id=%s', (node_id,))
+        connection.commit.assert_called_once()
+
+    def test_gateway_error_is_reported_once_and_keeps_record(self):
+        connection = Mock()
+        @contextmanager
+        def connect():
+            yield connection
+        hub = SimpleNamespace(send=AsyncMock(return_value={'ok': False, 'error': 'Orden no permitida'}))
+        app = FastAPI()
+        app.include_router(devices.create_router(lambda: {}, connect, hub))
+        with patch.object(devices, 'require_branch'), patch.object(devices, 'load_node',
+                return_value={'rpi_identifier': 'rpi', 'node_type': 'guide'}), TestClient(app) as client:
+            response = client.delete(f'/branches/{BRANCH}/devices/{OTHER}')
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('Orden no permitida', response.json()['detail'])
+        self.assertIn('retirar solo el registro', response.json()['detail'])
+        connection.execute.assert_not_called()
