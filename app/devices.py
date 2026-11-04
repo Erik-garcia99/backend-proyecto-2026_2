@@ -15,7 +15,12 @@ import time
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+import base64
+import hashlib
+import time
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -565,5 +570,107 @@ def create_router(current_user, get_connection, hub):
         _discoveries.pop(discovery_id, None)
         response.headers['Cache-Control'] = 'no-store'
         return {'id': discovery_id, 'status': 'stopped'}
+
+    @router.post('/gateways/{gateway_id}/devices/{device_id}/snapshot')
+    async def upload_snapshot(gateway_id: str, device_id: UUID, request: Request,
+                              response: Response):
+        """Recibe una imagen JPEG firmada por el gateway (Ed25519)."""
+        timestamp = request.headers.get('x-timestamp', '')
+        nonce = request.headers.get('x-nonce', '')
+        signature_b64 = request.headers.get('x-signature', '')
+        if not timestamp or not nonce or not signature_b64:
+            raise HTTPException(400, 'Faltan headers de firma')
+        try:
+            ts = int(timestamp)
+        except ValueError:
+            raise HTTPException(400, 'Timestamp inválido')
+        if abs(time.time() - ts) > 120:
+            raise HTTPException(401, 'Firma expirada; compruebe NTP en la Raspberry')
+        try:
+            signature = base64.b64decode(signature_b64, validate=True)
+        except (ValueError, TypeError):
+            raise HTTPException(401, 'Firma incorrecta') from None
+
+        raw = await request.body()
+        if not raw or len(raw) > 200000:
+            raise HTTPException(413, 'Imagen demasiado grande o vacía')
+
+        image_hash = hashlib.sha256(raw).hexdigest()
+
+        with get_connection() as connection:
+            gateway = connection.execute(
+                '''SELECT g.id, g.branch_id, g.device_public_key, g.is_active
+                   FROM gateway g JOIN branch b ON b.id=g.branch_id
+                   JOIN organization o ON o.id=b.organization_id
+                   WHERE g.rpi_identifier=%s AND g.is_active AND b.is_active AND o.is_active''',
+                (gateway_id,)).fetchone()
+            if not gateway or not gateway['device_public_key']:
+                raise HTTPException(403, 'Gateway no registrado o desactivado')
+            public_key = base64.b64decode(gateway['device_public_key'], validate=True)
+            message = f'selfiq-snapshot-v1\\n{gateway_id}\\n{timestamp}\\n{nonce}\\n{device_id}\\n{image_hash}'.encode()
+            try:
+                Ed25519PublicKey.from_public_bytes(public_key).verify(signature, message)
+            except (ValueError, InvalidSignature):
+                raise HTTPException(401, 'Firma no corresponde al gateway') from None
+
+            # Verificar que el dispositivo pertenece al gateway
+            node = connection.execute(
+                '''SELECT n.id FROM esp32_node n WHERE n.id=%s AND n.gateway_id=%s''',
+                (device_id, gateway['id'])).fetchone()
+            if not node:
+                raise HTTPException(404, 'Dispositivo no encontrado en este gateway')
+
+            # Guardar snapshot (se conserva historial; GET devuelve el mas reciente)
+            connection.execute(
+                '''INSERT INTO snapshot (branch_id, device_id, data, content_type, captured_at)
+                   VALUES (%s, %s, %s, 'image/jpeg', NOW())''',
+                (gateway['branch_id'], device_id, raw))
+            connection.commit()
+
+        response.headers['Cache-Control'] = 'no-store'
+        return {'ok': True, 'bytes': len(raw), 'device_id': str(device_id)}
+
+    @router.get('/branches/{branch_id}/devices/{device_id}/snapshot')
+    def get_snapshot(branch_id: UUID, device_id: UUID, response: Response,
+                     user=Depends(current_user)):
+        with get_connection() as connection:
+            require_branch(connection, branch_id, user)
+            node = load_node(connection, branch_id, device_id)
+            row = connection.execute(
+                '''SELECT data, captured_at FROM snapshot WHERE device_id=%s
+                   ORDER BY captured_at DESC LIMIT 1''',
+                (device_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, 'Sin imagen para este dispositivo')
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['X-Captured-At'] = str(row['captured_at'])
+        return Response(content=row['data'], media_type='image/jpeg')
+
+    @router.post('/branches/{branch_id}/devices/{device_id}/snapshot/request')
+    async def request_snapshot(branch_id: UUID, device_id: UUID, response: Response,
+                              user=Depends(current_user)):
+        with get_connection() as connection:
+            require_branch(connection, branch_id, user)
+            node = load_node(connection, branch_id, device_id)
+            gateway = connection.execute(
+                'SELECT rpi_identifier FROM gateway WHERE id=%s AND is_active',
+                (node['gateway_id'],)).fetchone()
+        if not gateway:
+            raise HTTPException(404, 'El equipo principal de la sucursal no está disponible')
+        import uuid as _uuid
+        req_id = str(_uuid.uuid4())
+        try:
+            result = await hub.send(gateway['rpi_identifier'], 'snapshot.request', payload={
+                'node_id': str(device_id),
+                'branch_id': str(branch_id),
+                'module': 'shelf_cam',
+                'req_id': req_id,
+            })
+        except HTTPException as exc:
+            raise HTTPException(exc.status_code, f'No se pudo solicitar la foto: {exc.detail}') from None
+        if not result or result.get('ok') is not True:
+            raise HTTPException(502, (result or {}).get('error') or 'La Raspberry no confirmó el envío')
+        response.headers['Cache-Control'] = 'no-store'
+        return {'confirmed': True, 'req_id': req_id}
 
     return router

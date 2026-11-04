@@ -114,6 +114,19 @@ class OccupancyResponse(BaseModel):
     status: Literal['ok', 'stale', 'no_data']
 
 
+class HealthResponse(BaseModel):
+    esp_id: UUID
+    fps: float | None
+    heap: int | None
+    fails: int | None
+    uptime_s: int | None
+    profile: int | None
+    measured_at: datetime | None
+    age_seconds: int | None
+    stale_after_seconds: int
+    status: Literal['ok', 'stale', 'no_data']
+
+
 def flux_string(value):
     # JSON quoting plus escaping Flux string interpolation.
     return json.dumps(str(value), ensure_ascii=False).replace('${', r'\${')
@@ -231,6 +244,87 @@ def _fetch_point(settings, branch_id, measurement, field, column):
         raise HTTPException(502, 'No se pudo consultar InfluxDB; revisa versión, esquema y configuración') from None
 
 
+def _fetch_point_by_esp(settings, esp_id, measurement, field='value'):
+    headers = {'Authorization': 'Token ' + settings.token}
+    result = None
+    try:
+        with httpx.Client(timeout=settings.timeout_seconds, follow_redirects=False) as client:
+            if settings.version == '2':
+                q = flux_string
+                query = (f'from(bucket: {q(settings.bucket)})\n'
+                         f'  |> range(start: -{settings.lookback_hours}h)\n'
+                         f'  |> filter(fn: (r) => r._measurement == {q(measurement)}'
+                         f' and r._field == {q(field)}'
+                         f' and r["esp_id"] == {q(esp_id)})\n'
+                         '  |> last()\n  |> group()\n  |> sort(columns: ["_time"], desc: true)\n'
+                         '  |> limit(n: 1)\n  |> keep(columns: ["_time", "_value"])')
+                result = client.post(settings.url + '/api/v2/query', params={'org': settings.org},
+                                     headers={**headers, 'Accept': 'application/csv',
+                                              'Content-Type': 'application/vnd.flux'},
+                                     content=query.encode())
+            else:
+                query = (f'SELECT {influx_identifier(field)} AS {influx_identifier("value")} '
+                         f'FROM {influx_identifier(measurement)} '
+                         f'WHERE "esp_id" = \'{esp_id}\' '
+                         f'AND time >= now() - {settings.lookback_hours}h AND time <= now() '
+                         'ORDER BY time DESC LIMIT 1')
+                params = {'db': settings.database, 'q': query}
+                if settings.retention_policy:
+                    params['rp'] = settings.retention_policy
+                result = client.get(settings.url + '/query', params=params,
+                                    headers={**headers, 'Accept': 'application/json'})
+            if result.status_code in {401, 403}:
+                raise HTTPException(503, 'Revisa el token de lectura y sus permisos en InfluxDB')
+            if result.status_code == 429:
+                raise HTTPException(503, 'InfluxDB alcanzó su límite de consultas; intenta más tarde')
+            result.raise_for_status()
+            point = parse_flux(result.text) if settings.version == '2' else parse_influxql(result.json(), 'value')
+        if point is None:
+            return None
+        now = datetime.now(timezone.utc)
+        measured_at = datetime.fromisoformat(point[0].replace('Z', '+00:00'))
+        value = float(point[1])
+        if not math.isfinite(value) or measured_at.tzinfo is None or measured_at > now:
+            raise ValueError('Invalid value or timestamp')
+        return measured_at, value
+    except httpx.TimeoutException:
+        raise HTTPException(504, 'InfluxDB tardó demasiado en responder') from None
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError, OverflowError, csv.Error) as exc:
+        if result is not None:
+            log.warning('InfluxDB respondió HTTP %s: %s', result.status_code, provider_error(result))
+        else:
+            log.warning('No se pudo conectar a InfluxDB (%s)', type(exc).__name__)
+        raise HTTPException(502, 'No se pudo consultar InfluxDB; revisa versión, esquema y configuración') from None
+
+
+def read_health(settings, esp_id):
+    measurements = {'fps': 'cam_fps', 'heap': 'cam_heap', 'fails': 'cam_fails',
+                    'uptime_s': 'cam_uptime', 'profile': 'cam_profile'}
+    values = {}
+    latest_time = None
+    for key, measurement in measurements.items():
+        point = _fetch_point_by_esp(settings, esp_id, measurement)
+        if point is not None:
+            values[key] = point[1]
+            if latest_time is None or point[0] > latest_time:
+                latest_time = point[0]
+        else:
+            values[key] = None
+    age, status = _age_and_status(latest_time, 120)
+    return HealthResponse(
+        esp_id=UUID(str(esp_id)),
+        fps=values.get('fps'),
+        heap=int(values['heap']) if values.get('heap') is not None else None,
+        fails=int(values['fails']) if values.get('fails') is not None else None,
+        uptime_s=int(values['uptime_s']) if values.get('uptime_s') is not None else None,
+        profile=int(values['profile']) if values.get('profile') is not None else None,
+        measured_at=latest_time,
+        age_seconds=age,
+        stale_after_seconds=120,
+        status=status,
+    )
+
+
 def _age_and_status(measured_at, stale_seconds):
     if measured_at is None:
         return None, 'no_data'
@@ -305,5 +399,17 @@ def create_router(current_user, get_connection):
         authorized_branch(branch_id, user)
         response.headers['Cache-Control'] = 'no-store'
         return read_occupancy(InfluxSettings.from_env(), branch_id)
+
+    @router.get('/branches/{branch_id}/devices/{device_id}/health', response_model=HealthResponse)
+    def device_health(branch_id: UUID, device_id: UUID, response: Response, user=Depends(current_user)):
+        with get_connection() as connection:
+            node = connection.execute(
+                '''SELECT n.id FROM esp32_node n JOIN gateway g ON g.id=n.gateway_id
+                   WHERE n.id=%s AND g.branch_id=%s''', (device_id, branch_id)).fetchone()
+        if not node:
+            raise HTTPException(404, 'Dispositivo no encontrado en esta sucursal')
+        authorized_branch(branch_id, user)
+        response.headers['Cache-Control'] = 'no-store'
+        return read_health(InfluxSettings.from_env(), str(device_id))
 
     return router

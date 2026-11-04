@@ -12,7 +12,7 @@ import secrets
 
 
 class GatewayCommand(BaseModel):
-    command: Literal['tcp.enable', 'tcp.disable', 'status']
+    command: Literal['tcp.enable', 'tcp.disable', 'status', 'snapshot.request']
 
 
 class GatewayTokenRequest(BaseModel):
