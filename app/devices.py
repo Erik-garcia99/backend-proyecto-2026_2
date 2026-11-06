@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 import base64
 import hashlib
 import time
@@ -95,6 +95,24 @@ class LightTest(BaseModel):
     duration_seconds: int = Field(default=5, ge=1, le=30)
 
 
+class ProductCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    sku: str = Field(min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=160)
+
+
+class ShelfLink(BaseModel):
+    shelf_id: UUID
+
+
+class ShelfCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=120)
+    location_label: str | None = Field(default=None, max_length=160)
+
+
 def iso(value):
     return value.isoformat() if isinstance(value, datetime) else None
 
@@ -112,7 +130,8 @@ def require_branch(connection, branch_id: UUID, user):
 
 
 def load_node(connection, branch_id: UUID, device_id: UUID, *, node_type=None, lock=False):
-    query = '''SELECT n.*, g.branch_id AS gateway_branch_id, g.rpi_identifier
+    query = '''SELECT n.*, g.branch_id AS gateway_branch_id, g.rpi_identifier,
+                      g.display_name AS gateway_name
                FROM esp32_node n
                JOIN gateway g ON g.id=n.gateway_id
                JOIN branch b ON b.id=g.branch_id
@@ -165,6 +184,15 @@ def serialize_device(node):
         'displayCode': display_code,
         'macAddress': node.get('mac_address'),
         'gatewayId': node.get('rpi_identifier') or str(node['gateway_id']),
+        'gatewayName': node.get('gateway_name'),
+        'firmwareVersion': node.get('firmware_version'),
+        'ipAddress': str(node['ip_address']) if node.get('ip_address') else None,
+        'wifiRssi': (float(node['wifi_rssi'])
+                     if node.get('wifi_rssi') is not None else None),
+        'batteryLevelPct': (float(node['battery_level_pct'])
+                            if node.get('battery_level_pct') is not None else None),
+        'powerSource': node.get('power_source'),
+        'registeredAt': iso(node.get('registered_at')),
     }
 
 
@@ -175,6 +203,29 @@ def serialize_light(row):
         'shelfId': str(row['shelf_id']),
         'shelfName': row.get('shelf_name'),
         'channel': row['led_index'],
+    }
+
+
+def serialize_product(row):
+    return {
+        'id': str(row['id']),
+        'sku': row['sku'],
+        'name': row['name'],
+        'active': row['is_active'],
+    }
+
+
+def serialize_shelf(row):
+    camera_node_id = row.get('camera_node_id')
+    return {
+        'id': str(row['id']),
+        'name': row['name'],
+        'location': row.get('location_label'),
+        'branchId': str(row['branch_id']),
+        'cameraNodeId': str(camera_node_id) if camera_node_id else None,
+        'roiVersion': row.get('roi_version', 0),
+        'roiAppliedVersion': row.get('roi_applied_version', 0),
+        'roiAppliedAt': iso(row.get('roi_applied_at')),
     }
 
 
@@ -254,7 +305,8 @@ def create_router(current_user, get_connection, hub):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
             rows = connection.execute(
-                '''SELECT n.*, g.rpi_identifier FROM esp32_node n
+                '''SELECT n.*, g.rpi_identifier, g.display_name AS gateway_name
+                   FROM esp32_node n
                    JOIN gateway g ON g.id=n.gateway_id
                    JOIN branch b ON b.id=g.branch_id
                    JOIN organization o ON o.id=b.organization_id
@@ -402,6 +454,119 @@ def create_router(current_user, get_connection, hub):
         if not shelf:
             raise HTTPException(404, 'Estante no encontrado en esta sucursal')
         return shelf
+
+    # --- Fase 3: catálogo mínimo de productos y vínculo cámara-repisa ---
+
+    @router.get('/branches/{branch_id}/products')
+    def list_products(branch_id: UUID, response: Response,
+                      search: str | None = Query(default=None, max_length=100),
+                      limit: int = Query(default=20, ge=1, le=100),
+                      user=Depends(current_user)):
+        with get_connection() as connection:
+            branch = require_branch(connection, branch_id, user)
+            term = (search or '').strip()
+            pattern = f'%{term}%' if term else None
+            rows = connection.execute(
+                '''SELECT id, sku, name, is_active FROM product
+                   WHERE organization_id=%s AND is_active
+                     AND (%s::text IS NULL OR sku ILIKE %s OR name ILIKE %s)
+                   ORDER BY name, sku LIMIT %s''',
+                (branch['organization_id'], pattern, pattern, pattern, limit)).fetchall()
+        response.headers['Cache-Control'] = 'no-store'
+        return [serialize_product(row) for row in rows]
+
+    @router.post('/branches/{branch_id}/products', status_code=201)
+    def create_product(branch_id: UUID, body: ProductCreate, response: Response,
+                       user=Depends(current_user)):
+        with get_connection() as connection:
+            branch = require_branch(connection, branch_id, user)
+            existing = connection.execute(
+                '''SELECT 1 FROM product
+                   WHERE organization_id=%s AND lower(sku)=lower(%s)''',
+                (branch['organization_id'], body.sku)).fetchone()
+            if existing:
+                raise HTTPException(409, 'Ya existe un producto con ese SKU')
+            try:
+                product = connection.execute(
+                    '''INSERT INTO product(organization_id, sku, name)
+                       VALUES(%s, %s, %s)
+                       RETURNING id, sku, name, is_active''',
+                    (branch['organization_id'], body.sku, body.name)).fetchone()
+                connection.commit()
+            except UniqueViolation:
+                connection.rollback()
+                raise HTTPException(409, 'Ya existe un producto con ese SKU') from None
+        response.headers['Cache-Control'] = 'no-store'
+        return serialize_product(product)
+
+    @router.get('/branches/{branch_id}/devices/{device_id}/shelf')
+    def get_device_shelf(branch_id: UUID, device_id: UUID, response: Response,
+                         user=Depends(current_user)):
+        with get_connection() as connection:
+            require_branch(connection, branch_id, user)
+            load_node(connection, branch_id, device_id, node_type='shelf_cam')
+            shelf = connection.execute(
+                '''SELECT * FROM shelf
+                   WHERE camera_node_id=%s AND branch_id=%s AND is_active''',
+                (device_id, branch_id)).fetchone()
+        response.headers['Cache-Control'] = 'no-store'
+        return {'shelf': serialize_shelf(shelf) if shelf else None}
+
+    @router.put('/branches/{branch_id}/devices/{device_id}/shelf')
+    def link_device_shelf(branch_id: UUID, device_id: UUID, body: ShelfLink,
+                          response: Response, user=Depends(current_user)):
+        with get_connection() as connection:
+            require_branch(connection, branch_id, user)
+            load_node(connection, branch_id, device_id, node_type='shelf_cam', lock=True)
+            shelf = connection.execute(
+                '''SELECT * FROM shelf
+                   WHERE id=%s AND branch_id=%s AND is_active FOR UPDATE''',
+                (body.shelf_id, branch_id)).fetchone()
+            if not shelf:
+                raise HTTPException(404, 'Estante no encontrado en esta sucursal')
+            current = connection.execute(
+                '''SELECT id, name FROM shelf
+                   WHERE camera_node_id=%s AND branch_id=%s AND id<>%s''',
+                (device_id, branch_id, body.shelf_id)).fetchone()
+            if current:
+                raise HTTPException(409, 'La cámara ya tiene una repisa vinculada')
+            if shelf.get('camera_node_id') and shelf['camera_node_id'] != device_id:
+                raise HTTPException(409, 'Ese estante ya está vinculado a otra cámara')
+            updated = connection.execute(
+                '''UPDATE shelf
+                   SET camera_node_id=%s, camera_node_type='shelf_cam', updated_at=NOW()
+                   WHERE id=%s RETURNING *''',
+                (device_id, body.shelf_id)).fetchone()
+            connection.commit()
+        response.headers['Cache-Control'] = 'no-store'
+        return serialize_shelf(updated)
+
+    @router.post('/branches/{branch_id}/devices/{device_id}/shelf', status_code=201)
+    def create_device_shelf(branch_id: UUID, device_id: UUID, body: ShelfCreate,
+                            response: Response, user=Depends(current_user)):
+        with get_connection() as connection:
+            require_branch(connection, branch_id, user)
+            load_node(connection, branch_id, device_id, node_type='shelf_cam', lock=True)
+            current = connection.execute(
+                'SELECT * FROM shelf WHERE camera_node_id=%s AND branch_id=%s',
+                (device_id, branch_id)).fetchone()
+            if current:
+                response.headers['Cache-Control'] = 'no-store'
+                response.status_code = 200
+                return serialize_shelf(current)
+            try:
+                shelf = connection.execute(
+                    '''INSERT INTO shelf(branch_id, camera_node_id, camera_node_type,
+                                        name, location_label)
+                       VALUES(%s, %s, 'shelf_cam', %s, %s)
+                       RETURNING *''',
+                    (branch_id, device_id, body.name, body.location_label)).fetchone()
+                connection.commit()
+            except UniqueViolation:
+                connection.rollback()
+                raise HTTPException(409, 'La cámara ya tiene una repisa vinculada') from None
+        response.headers['Cache-Control'] = 'no-store'
+        return serialize_shelf(shelf)
 
     @router.post('/branches/{branch_id}/devices/{device_id}/lights', status_code=201)
     def add_light(branch_id: UUID, device_id: UUID, body: LightPayload,
