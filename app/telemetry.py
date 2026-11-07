@@ -369,14 +369,17 @@ def create_router(current_user, get_connection):
     @router.get('/telemetry/branches')
     def branches(response: Response, user=Depends(current_user)):
         with get_connection() as connection:
-            rows = connection.execute('''SELECT b.id,b.name,b.organization_id FROM branch b
+            rows = connection.execute('''SELECT b.id,b.name,b.organization_id,
+                    COALESCE(g.is_online,FALSE) AS is_online
+                FROM branch b
                 JOIN organization o ON o.id=b.organization_id
+                LEFT JOIN gateway g ON g.branch_id=b.id AND g.is_active
                 WHERE b.is_active AND o.is_active AND (%s OR (b.organization_id=%s
                     AND (%s OR b.id=%s))) ORDER BY b.name,b.id''',
                 (user['is_superuser'], user['organization_id'], user['role'].lower() in {'owner', 'gerencia'},
                  user['branch_id'])).fetchall()
         response.headers['Cache-Control'] = 'no-store'
-        return [{'id': str(row['id']), 'name': row['name']} for row in rows]
+        return [{'id': str(row['id']), 'name': row['name'], 'is_online': bool(row['is_online'])} for row in rows]
 
     def authorized_branch(branch_id, user):
         with get_connection() as connection:
