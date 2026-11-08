@@ -9,6 +9,7 @@ from psycopg.errors import UniqueViolation
 from . import db
 from .gateways import GatewayHub, create_router
 from .devices import create_router as devices_router, close_discoveries
+from .rois import create_router as rois_router
 from .node_registration import make_router as node_router
 from .telemetry import create_router as telemetry_router
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
@@ -240,4 +241,5 @@ app.include_router(create_router(gateway_hub,current_user,db.get_connection))
 app.include_router(token_router(current_user,db.get_connection,gateway_hub))
 app.include_router(node_router(db.get_connection, gateway_hub, current_user))
 app.include_router(devices_router(current_user, db.get_connection, gateway_hub))
+app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))

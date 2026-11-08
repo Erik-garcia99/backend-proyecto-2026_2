@@ -1,6 +1,7 @@
 import time
 import unittest
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import UUID
@@ -167,3 +168,39 @@ class DeleteTests(unittest.TestCase):
         self.assertIn('Orden no permitida', response.json()['detail'])
         self.assertIn('retirar solo el registro', response.json()['detail'])
         connection.execute.assert_not_called()
+
+
+class DeviceSerializationTests(unittest.TestCase):
+    def test_exposes_technical_fields_for_diagnostics(self):
+        now = datetime.now(timezone.utc)
+        row = {
+            'id': OTHER,
+            'gateway_id': BRANCH,
+            'node_type': 'shelf_cam',
+            'name': 'Cámara repisa',
+            'location': 'Piso 1',
+            'node_code': 'NODO-ABC123',
+            'mac_address': 'AA:BB:CC:DD:EE:FF',
+            'is_online': True,
+            'last_heartbeat_at': now,
+            'registered_at': now,
+            'rpi_identifier': 'rpi-1',
+            'gateway_name': 'Gateway principal',
+            'firmware_version': '2.3.1',
+            'ip_address': '192.168.1.42',
+            'wifi_rssi': -57,
+            'battery_level_pct': None,
+            'power_source': 'mains',
+        }
+
+        result = devices.serialize_device(row)
+
+        self.assertEqual(result['gatewayId'], 'rpi-1')
+        self.assertEqual(result['gatewayName'], 'Gateway principal')
+        self.assertEqual(result['firmwareVersion'], '2.3.1')
+        self.assertEqual(result['ipAddress'], '192.168.1.42')
+        self.assertEqual(result['wifiRssi'], -57.0)
+        self.assertIsNone(result['batteryLevelPct'])
+        self.assertEqual(result['powerSource'], 'mains')
+        self.assertEqual(result['registeredAt'], now.isoformat())
+
