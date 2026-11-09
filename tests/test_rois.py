@@ -218,6 +218,10 @@ class ListTests(RoiBase):
                 'w': 0.3,
                 'h': 0.25,
                 'visual_capacity_units': 12,
+                'calibration_status': 'uncalibrated',
+                'calibration_version': 0,
+                'last_calibrated_at': None,
+                'calibration_invalidated_reason': None,
             }],
         })
 
@@ -319,6 +323,17 @@ class ReplaceTests(RoiBase):
 
         self.assertEqual(response.status_code, 409)
         self.assertIn('recarga', response.json()['detail'])
+        self.assertEqual(connection.commits, 0)
+
+    def test_put_is_blocked_while_a_calibration_is_open(self):
+        connection = FakeConnection(
+            lambda sql, params: result(row=shelf_row(open_calibration_id=ROI_1)))
+        response = self.client(connection).put(
+            f'/branches/{BRANCH}/shelves/{SHELF}/rois',
+            json=body(item()))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('calibración abierta', response.json()['detail'])
         self.assertEqual(connection.commits, 0)
 
     def test_rejects_roi_id_from_another_shelf(self):

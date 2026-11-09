@@ -529,6 +529,17 @@ def create_router(current_user, get_connection, hub):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
             load_node(connection, branch_id, device_id, node_type='shelf_cam', lock=True)
+            open_calibration = connection.execute(
+                '''SELECT 1 FROM roi_calibration_session
+                    WHERE camera_node_id=%s
+                      AND state IN ('draft','empty_ready','pair_ready',
+                                    'committing','cancel_pending')
+                      AND expires_at > NOW()
+                    LIMIT 1''',
+                (device_id,)).fetchone()
+            if open_calibration:
+                raise HTTPException(
+                    409, 'Hay una calibración abierta en esta cámara; termínala o cancélala antes de reenlazarla')
             shelf = connection.execute(
                 '''SELECT * FROM shelf
                    WHERE id=%s AND branch_id=%s AND is_active FOR UPDATE''',
