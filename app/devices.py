@@ -113,6 +113,13 @@ class ShelfCreate(BaseModel):
     location_label: str | None = Field(default=None, max_length=160)
 
 
+class ShelfUpdate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(min_length=1, max_length=120)
+    location_label: str | None = Field(default=None, max_length=160)
+
+
 def iso(value):
     return value.isoformat() if isinstance(value, datetime) else None
 
@@ -567,6 +574,25 @@ def create_router(current_user, get_connection, hub):
                 raise HTTPException(409, 'La cámara ya tiene una repisa vinculada') from None
         response.headers['Cache-Control'] = 'no-store'
         return serialize_shelf(shelf)
+
+    @router.patch('/branches/{branch_id}/shelves/{shelf_id}')
+    def update_shelf(branch_id: UUID, shelf_id: UUID, body: ShelfUpdate,
+                     response: Response, user=Depends(current_user)):
+        with get_connection() as connection:
+            require_branch(connection, branch_id, user)
+            shelf = connection.execute(
+                '''SELECT * FROM shelf WHERE id=%s AND branch_id=%s AND is_active FOR UPDATE''',
+                (shelf_id, branch_id)).fetchone()
+            if not shelf:
+                raise HTTPException(404, 'Estante no encontrado en esta sucursal')
+            updated = connection.execute(
+                '''UPDATE shelf
+                      SET name=%s, location_label=%s, updated_at=NOW()
+                    WHERE id=%s RETURNING *''',
+                (body.name, body.location_label, shelf_id)).fetchone()
+            connection.commit()
+        response.headers['Cache-Control'] = 'no-store'
+        return serialize_shelf(updated)
 
     @router.post('/branches/{branch_id}/devices/{device_id}/lights', status_code=201)
     def add_light(branch_id: UUID, device_id: UUID, body: LightPayload,

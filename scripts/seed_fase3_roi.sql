@@ -33,7 +33,7 @@ DECLARE
     p_camera      uuid := '5c485efa-cc20-4f9a-91eb-ceeba0f99289';
 
     -- Opcionales: puedes cambiar nombres y SKU.
-    p_shelf_name  text := 'Repisa de prueba Fase 3';
+    p_shelf_name  text := 'Repisa principal';
     p_location    text := 'Piso 1';
     p_sku_a       text := 'SKU-FASE3-A';
     p_name_a      text := 'Producto de prueba A';
