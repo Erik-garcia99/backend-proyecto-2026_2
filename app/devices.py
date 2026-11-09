@@ -136,7 +136,7 @@ def require_branch(connection, branch_id: UUID, user):
     return branch
 
 
-def load_node(connection, branch_id: UUID, device_id: UUID, *, node_type=None, lock=False):
+def load_node(connection, branch_id: UUID, device_id: UUID, *, node_type=None, lock=False, candidate=False):
     query = '''SELECT n.*, g.branch_id AS gateway_branch_id, g.rpi_identifier,
                       g.display_name AS gateway_name
                FROM esp32_node n
@@ -146,6 +146,8 @@ def load_node(connection, branch_id: UUID, device_id: UUID, *, node_type=None, l
                WHERE n.id=%s AND g.branch_id=%s AND g.is_active
                  AND b.is_active AND o.is_active'''
     params = [device_id, branch_id]
+    if not candidate:
+        query += " AND n.node_code IS NOT NULL AND n.registration_status='registered'"
     if node_type:
         query += ' AND n.node_type=%s'
         params.append(node_type)
@@ -318,6 +320,7 @@ def create_router(current_user, get_connection, hub):
                    JOIN branch b ON b.id=g.branch_id
                    JOIN organization o ON o.id=b.organization_id
                     WHERE g.branch_id=%s AND g.is_active AND b.is_active AND o.is_active
+                      AND n.node_code IS NOT NULL AND n.registration_status='registered'
                       AND (%s::text IS NULL OR g.rpi_identifier=%s)
                     ORDER BY n.created_at''',
                 (branch_id, gateway_id, gateway_id)).fetchall()
@@ -355,7 +358,7 @@ def create_router(current_user, get_connection, hub):
                         response: Response, user=Depends(current_user)):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
-            node = load_node(connection, branch_id, device_id, lock=True)
+            node = load_node(connection, branch_id, device_id, lock=True, candidate=True)
             if body.gateway_id and node['rpi_identifier'] != body.gateway_id:
                 raise HTTPException(409, 'El dispositivo no pertenece al equipo seleccionado')
             if body.discovery_id:
@@ -365,6 +368,7 @@ def create_router(current_user, get_connection, hub):
             code = node.get('node_code') or 'NODO-' + uuid4().hex[:6].upper()
             updated = connection.execute(
                 '''UPDATE esp32_node SET name=%s, location=%s, node_code=%s,
+                     registered_at=CASE WHEN node_code IS NULL THEN NOW() ELSE registered_at END,
                      registration_status='registered', updated_at=NOW()
                    WHERE id=%s RETURNING *''',
                 (body.name, body.location, code, device_id)).fetchone()
@@ -393,7 +397,7 @@ def create_router(current_user, get_connection, hub):
                             force: bool = False, user=Depends(current_user)):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
-            node = load_node(connection, branch_id, device_id)
+            node = load_node(connection, branch_id, device_id, candidate=True)
         reset_error = ''
         if not force:
             try:
@@ -790,13 +794,17 @@ def create_router(current_user, get_connection, hub):
 
         with get_connection() as connection:
             gateway = connection.execute(
-                '''SELECT g.id, g.branch_id, g.device_public_key, g.is_active
+                '''SELECT g.id, g.branch_id, g.device_public_key, g.is_active, t.token_hash
                    FROM gateway g JOIN branch b ON b.id=g.branch_id
                    JOIN organization o ON o.id=b.organization_id
+                   LEFT JOIN organization_token t ON t.id=g.registered_with_token
                    WHERE g.rpi_identifier=%s AND g.is_active AND b.is_active AND o.is_active''',
                 (gateway_id,)).fetchone()
             if not gateway or not gateway['device_public_key']:
                 raise HTTPException(403, 'Gateway no registrado o desactivado')
+            from .gateway_registry import active_token
+            if not gateway['token_hash'] or not active_token(connection, gateway['token_hash'], gateway['branch_id']):
+                raise HTTPException(403, 'Token de sucursal revocado')
             public_key = base64.b64decode(gateway['device_public_key'], validate=True)
             message = f'selfiq-snapshot-v1\\n{gateway_id}\\n{timestamp}\\n{nonce}\\n{device_id}\\n{image_hash}'.encode()
             try:
@@ -806,7 +814,8 @@ def create_router(current_user, get_connection, hub):
 
             # Verificar que el dispositivo pertenece al gateway
             node = connection.execute(
-                '''SELECT n.id FROM esp32_node n WHERE n.id=%s AND n.gateway_id=%s''',
+                '''SELECT n.id FROM esp32_node n WHERE n.id=%s AND n.gateway_id=%s
+                     AND n.node_code IS NOT NULL AND n.registration_status='registered' ''',
                 (device_id, gateway['id'])).fetchone()
             if not node:
                 raise HTTPException(404, 'Dispositivo no encontrado en este gateway')

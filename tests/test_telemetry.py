@@ -26,6 +26,22 @@ def csv_point(timestamp, value=25.5):
 
 
 class InfluxTests(unittest.TestCase):
+    def test_registered_nodes_filter_precedes_latest_selection(self):
+        settings = replace(SETTINGS, node_ids=(str(OTHER_BRANCH),))
+        flux = flux_query(settings, BRANCH)
+        self.assertIn(f'set: ["{OTHER_BRANCH}"]', flux)
+        self.assertLess(flux.index('contains('), flux.index('|> last()'))
+        query = influxql_query(settings, BRANCH)
+        self.assertIn(f'"esp_id" = \'{OTHER_BRANCH}\'', query)
+        self.assertLess(query.index('"esp_id"'), query.index('ORDER BY'))
+
+    def test_no_registered_nodes_never_queries_influx(self):
+        with patch('app.telemetry.httpx.Client') as client:
+            settings = replace(SETTINGS, node_ids=())
+            self.assertEqual(read_temperature(settings, BRANCH).status, 'no_data')
+            self.assertEqual(read_occupancy(settings, BRANCH).status, 'no_data')
+            client.assert_not_called()
+
     def read_with_response(self, response, settings=SETTINGS, reader=read_temperature):
         real_client = httpx.Client
         requests = []
@@ -196,6 +212,7 @@ class RouterTests(unittest.TestCase):
         self.branch = {'id': BRANCH, 'organization_id': ORG}
         self.connection = Mock()
         self.connection.execute.return_value.fetchone.return_value = self.branch
+        self.connection.execute.return_value.fetchall.return_value = []
 
         @contextmanager
         def get_connection():
@@ -257,6 +274,18 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(response.headers['Cache-Control'], 'no-store')
         self.assertEqual(response.json()['status'], 'no_data')
 
+    def test_route_passes_only_database_registered_ids_to_influx(self):
+        self.connection.execute.return_value.fetchall.return_value = [{'id': OTHER_BRANCH}]
+        payload = {'branch_id': BRANCH, 'temperature_c': None, 'measured_at': None,
+                   'age_seconds': None, 'stale_after_seconds': 90, 'status': 'no_data'}
+        with patch('app.telemetry.InfluxSettings.from_env', return_value=SETTINGS), \
+                patch('app.telemetry.read_temperature', return_value=payload) as read:
+            self.assertEqual(self.client.get(self.path).status_code, 200)
+            self.assertEqual(read.call_args.args[0].node_ids, (str(OTHER_BRANCH),))
+        sql = self.connection.execute.call_args.args[0]
+        self.assertIn('n.node_code IS NOT NULL', sql)
+        self.assertIn("n.registration_status='registered'", sql)
+
     def test_roles_and_organization_isolation(self):
         self.assertTrue(can_read_branch(self.user, self.branch))
         self.assertTrue(can_read_branch({**self.user, 'branch_id': None, 'role': 'owner'}, self.branch))
@@ -264,9 +293,9 @@ class RouterTests(unittest.TestCase):
         self.assertTrue(can_read_branch({**self.user, 'is_superuser': True}, self.branch))
 
     def test_branch_list_scopes_sql_and_returns_only_public_fields(self):
-        self.connection.execute.return_value.fetchall.return_value = [{**self.branch, 'name': 'Piloto'}]
+        self.connection.execute.return_value.fetchall.return_value = [{**self.branch, 'name': 'Piloto', 'is_online': False}]
         response = self.client.get('/telemetry/branches')
-        self.assertEqual(response.json(), [{'id': str(BRANCH), 'name': 'Piloto'}])
+        self.assertEqual(response.json(), [{'id': str(BRANCH), 'name': 'Piloto', 'is_online': False}])
         self.assertEqual(self.connection.execute.call_args.args[1], (False, ORG, False, BRANCH))
         self.assertEqual(response.headers['Cache-Control'], 'no-store')
 
