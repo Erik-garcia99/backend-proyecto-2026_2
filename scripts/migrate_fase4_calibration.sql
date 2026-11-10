@@ -300,7 +300,9 @@ BEGIN
         EXECUTE 'ALTER TABLE public.snapshot ADD COLUMN IF NOT EXISTS purpose text NOT NULL DEFAULT ''snapshot''';
         EXECUTE 'ALTER TABLE public.snapshot ADD COLUMN IF NOT EXISTS calibration_session_id uuid';
         EXECUTE 'ALTER TABLE public.snapshot ADD COLUMN IF NOT EXISTS calibration_capture_id uuid';
+        EXECUTE 'ALTER TABLE public.snapshot ADD COLUMN IF NOT EXISTS image_sha256 text';
         EXECUTE 'CREATE INDEX IF NOT EXISTS ix_snapshot_branch_purpose ON public.snapshot (branch_id, purpose, created_at DESC)';
+        EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS ux_snapshot_calibration_capture ON public.snapshot (calibration_session_id, calibration_capture_id) WHERE calibration_capture_id IS NOT NULL';
         EXECUTE 'COMMENT ON COLUMN public.snapshot.purpose IS ''F-10/F-12: snapshot (alertas) o calibration (referencia). Las referencias activas no se purgan.''';
     END IF;
 END $$;
