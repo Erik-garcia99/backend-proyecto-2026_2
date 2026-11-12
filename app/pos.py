@@ -611,4 +611,61 @@ def create_router(current_user, get_connection):
             'occurred_at': _iso(r['occurred_at']),
         } for r in rows]
 
+    @router.get('/branches/{branch_id}/products/{product_id}/availability')
+    def product_availability(branch_id: UUID, product_id: UUID, user=Depends(current_user)):
+        require_action(user, 'pos.product.read')
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                org_id = branch_org(cursor, user, branch_id)
+                product = cursor.execute(
+                    'SELECT id, sku, name FROM product WHERE id=%s AND organization_id=%s',
+                    (product_id, org_id)).fetchone()
+                if not product:
+                    raise PosError(404, 'PRODUCT_NOT_FOUND', 'Producto no encontrado.',
+                                  {'product_id': str(product_id)})
+                checked_at = datetime.now(timezone.utc)
+                # Unidades lógicas: solo con permiso de inventario.
+                logical = None
+                if user.get('is_superuser') or (user.get('role') or '').lower() in POS_PERMISSIONS['pos.inventory.read']:
+                    inv = cursor.execute(
+                        '''SELECT quantity_on_hand, updated_at FROM branch_inventory
+                           WHERE branch_id=%s AND product_id=%s''',
+                        (branch_id, product_id)).fetchone()
+                    logical = {
+                        'quantity_on_hand': inv['quantity_on_hand'] if inv else 0,
+                        'updated_at': _iso(inv['updated_at']) if inv else None,
+                    }
+                # Estado visual: solo lectura, nunca modifica existencias.
+                rows = cursor.execute(
+                    '''SELECT r.id AS roi_id, r.name AS roi_name,
+                              s.id AS shelf_id, s.name AS shelf_name, s.location,
+                              rs.occupancy_pct, rs.status, rs.last_reading_at,
+                              rs.last_changed_at, rs.updated_at
+                       FROM roi r
+                       JOIN shelf s ON s.id = r.shelf_id
+                       LEFT JOIN roi_state rs ON rs.roi_id = r.id
+                       WHERE r.product_id = %s AND s.branch_id = %s AND r.is_active
+                       ORDER BY s.name, r.name''',
+                    (product_id, branch_id)).fetchall()
+                visual = [{
+                    'roi_id': str(r['roi_id']),
+                    'roi_name': r['roi_name'],
+                    'shelf_id': str(r['shelf_id']),
+                    'shelf_name': r['shelf_name'],
+                    'location': r['location'],
+                    'occupancy_pct': float(r['occupancy_pct']) if r['occupancy_pct'] is not None else None,
+                    'status': r['status'],
+                    'last_reading_at': _iso(r['last_reading_at']),
+                    'last_changed_at': _iso(r['last_changed_at']),
+                    'updated_at': _iso(r['updated_at']),
+                } for r in rows]
+                return {
+                    'product_id': str(product['id']),
+                    'sku': product['sku'],
+                    'name': product['name'],
+                    'logical': logical,
+                    'visual': visual,
+                    'checked_at': checked_at.isoformat(),
+                }
+
     return router
