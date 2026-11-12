@@ -50,6 +50,10 @@ log = logging.getLogger(__name__)
 
 FORMAT_VERSION = 1
 SESSION_TTL = timedelta(minutes=30)
+# Una cancelación es una operación corta: si el nodo no confirma, la sesión no
+# puede retener la cámara los 30 min completos del TTL. Pasado este plazo,
+# ``expire_stale_sessions`` la cierra en la siguiente lectura/creación.
+CANCEL_GRACE = timedelta(minutes=5)
 CAPTURE_TTL = timedelta(seconds=10)
 LIST_LIMIT = 20
 LIST_LIMIT_MAX = 50
@@ -496,8 +500,11 @@ def _validate_status_entry(value, field, *, draft=False):
                  f'El ACK no trae {field}.calibration_id')
     else:
         _hex(value.get('context_hash'), HEX64, f'{field}.context_hash')
-    _hex(value.get('empty_crc'), HEX8, f'{field}.empty_crc')
-    _hex(value.get('full_crc'), HEX8, f'{field}.full_crc')
+    for key in ('empty_crc', 'full_crc'):
+        _require(key in value, f'El ACK no trae {field}.{key}')
+        if draft and value[key] is None:
+            continue  # Referencia todavía no capturada; nunca inventar un CRC.
+        _hex(value[key], HEX8, f'{field}.{key}')
 
 
 def validate_status_ack(session, ack):
@@ -670,15 +677,16 @@ def mark_operation(connection, operation_id, status, *, code=None, detail=None, 
 
 
 def bump_session(connection, session_id, state=None, *, touch_expiry=True,
-                 confirmed=False, closed=False, error_code=None):
+                 confirmed=False, closed=False, error_code=None, ttl=None):
     sets = ['session_version=session_version+1', 'updated_at=NOW()']
     params = []
     if state is not None:
         sets.append('state=%s')
         params.append(state)
     if touch_expiry:
-        sets.append('expires_at=NOW() + %s')
-        params.append(SESSION_TTL)
+        sets.append('expires_at=LEAST(expires_at, NOW() + %s)' if ttl is not None
+                    else 'expires_at=NOW() + %s')
+        params.append(ttl or SESSION_TTL)
     if confirmed:
         sets.append('confirmed_at=NOW()')
     if closed:
@@ -865,6 +873,10 @@ def apply_cancel_ack(connection, operation, session, ack):
                        result={'status': 'cancelled'})
     else:
         code = ack.get('code') or 'cancel_failed'
+        # Un rechazo no prueba cancelación. Cerrar como fallo conserva la
+        # evidencia y libera la cámara sin presentar un éxito ficticio.
+        session = bump_session(connection, session['id'], 'failed',
+                               touch_expiry=False, closed=True, error_code=code)
         mark_operation(connection, operation['id'], 'rejected', code=code)
     return session
 
@@ -889,9 +901,14 @@ def apply_dispatch_failure(get_connection, operation_id, code, *, unknown):
         elif operation['action'] == 'commit' and not unknown:
             state = state_from_references(connection, session, 'pair_ready')
             bump_session(connection, session['id'], state, error_code=code)
-        elif operation['action'] == 'cancel' and not unknown:
-            state = state_from_references(connection, session)
-            bump_session(connection, session['id'], state, error_code=code)
+        elif operation['action'] == 'cancel' and session['state'] == 'cancel_pending':
+            if unknown:
+                # No renovar el plazo ni inventar cancelación ante timeout.
+                bump_session(connection, session['id'], touch_expiry=False,
+                             error_code=code)
+            else:
+                bump_session(connection, session['id'], 'failed',
+                             touch_expiry=False, closed=True, error_code=code)
         connection.commit()
 
 
@@ -1045,6 +1062,11 @@ async def dispatch_operation(get_connection, hub, operation_id, timeout=DISPATCH
                             "UPDATE roi_calibration SET status='failed' WHERE id=%s",
                             (reference['id'],))
                     session = bump_session(connection, session['id'], session['state'])
+                elif stored['action'] == 'cancel' and session['state'] == 'cancel_pending':
+                    # Rechazo explícito, no confirmación de borrado en NVS.
+                    session = bump_session(connection, session['id'], 'failed',
+                                           touch_expiry=False, closed=True,
+                                           error_code=exc.code)
                 mark_operation(connection, operation_id, 'rejected', code=exc.code)
                 connection.commit()
         return
@@ -1586,7 +1608,11 @@ def create_router(current_user, get_connection, hub=None):
             operation = insert_operation(
                 connection, session=session, roi_id=roi_id, action='cancel',
                 key=key, request_hash=request_hash, payload=request, user_id=user['id'])
-            session = bump_session(connection, session['id'], 'cancel_pending')
+            # Cancelar no renueva el TTL completo: es una operación de segundos.
+            # Si el nodo no confirma, la sesión caduca pronto y libera la cámara.
+            if session['state'] != 'cancel_pending':
+                session = bump_session(connection, session['id'], 'cancel_pending',
+                                       ttl=CANCEL_GRACE)
             result = {
                 'operation_id': str(operation['id']),
                 'session_version': session['session_version'],
