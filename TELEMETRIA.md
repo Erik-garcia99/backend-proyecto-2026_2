@@ -5,7 +5,14 @@
 
 La Raspberry sigue escribiendo como hasta ahora. La API **solo lee** InfluxDB y
 la tarjeta Temperatura de Inicio consulta la API cada 15 s mientras está activa.
-No se modifican firmware, MQTT, registros de nodos ni esquema de PostgreSQL.
+No se modifican firmware, MQTT ni el esquema de PostgreSQL.
+
+> **Registro obligatorio:** la API solo consulta puntos cuyo tag `esp_id`
+> pertenezca a un nodo confirmado (`node_code` no nulo y
+> `registration_status='registered'`) del gateway de esa sucursal. Un nodo
+> pendiente, eliminado o de otra sucursal nunca se muestra, aunque existan
+> puntos antiguos en InfluxDB. Sin nodos confirmados, la consulta devuelve
+> `no_data` y no llama a InfluxDB.
 
 ## 1. Identificar tu InfluxDB y los datos existentes
 

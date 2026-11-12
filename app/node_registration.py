@@ -136,6 +136,13 @@ def make_router(get_connection, hub, current_user):
 
     @router.post('/gateways/{gateway_id}/nodes/{node_id}/heartbeat')
     def node_heartbeat(gateway_id: str, node_id: UUID, body: NodeHeartbeat):
+        return node_access(gateway_id, node_id, body, presence=True)
+
+    @router.post('/gateways/{gateway_id}/nodes/{node_id}/authorize')
+    def authorize_node(gateway_id: str, node_id: UUID, body: NodeHeartbeat):
+        return node_access(gateway_id, node_id, body, presence=False)
+
+    def node_access(gateway_id, node_id, body, *, presence):
         """Presencia real: el gateway reenvía el estado MQTT del nodo, firmado."""
         if abs(time.time() - body.timestamp) > 120:
             raise HTTPException(401, 'Firma expirada; compruebe NTP en la Raspberry')
@@ -156,10 +163,28 @@ def make_router(get_connection, hub, current_user):
                 raise HTTPException(403, 'Token de sucursal revocado')
             try:
                 public_key = base64.b64decode(gateway['device_public_key'], validate=True)
+                message = heartbeat_message(gateway_id, str(node_id), body)
+                if not presence:
+                    message = message.replace(b'selfiq-node-heartbeat-v1', b'selfiq-node-authorize-v1', 1)
                 Ed25519PublicKey.from_public_bytes(public_key).verify(
-                    signature, heartbeat_message(gateway_id, str(node_id), body))
+                    signature, message)
             except (ValueError, InvalidSignature):
                 raise HTTPException(401, 'Firma no corresponde al gateway registrado') from None
+            node = conn.execute('''SELECT id,node_code,registration_status,registered_at
+                     FROM esp32_node WHERE id=%s AND gateway_id=%s''',
+                (node_id, gateway['id'])).fetchone()
+            if not node:
+                if not presence:
+                    return {'id': str(node_id), 'branch_id': str(gateway['branch_id']),
+                            'authorized': False, 'registered_at': None}
+                raise HTTPException(404, 'Nodo no registrado en este gateway')
+            if not presence:
+                return {'id': str(node_id), 'branch_id': str(gateway['branch_id']),
+                        'authorized': bool(node['node_code'] and
+                                           node['registration_status'] == 'registered' and
+                                           node['registered_at']),
+                        'registered_at': (node['registered_at'].timestamp()
+                                          if node['registered_at'] else None)}
             updated = conn.execute('''UPDATE esp32_node SET is_online=TRUE,
                      last_heartbeat_at=NOW(),updated_at=NOW()
                      WHERE id=%s AND gateway_id=%s RETURNING id''',
@@ -181,7 +206,9 @@ def make_router(get_connection, hub, current_user):
             rows = conn.execute('''SELECT n.id,n.mac_address,n.node_type,n.node_code,n.name,
                        n.registration_status,n.registered_at,n.gateway_id,n.is_online
                 FROM esp32_node n JOIN gateway g ON g.id=n.gateway_id
-                WHERE g.branch_id=%s ORDER BY n.created_at''', (branch_id,)).fetchall()
+                WHERE g.branch_id=%s AND g.is_active
+                  AND n.node_code IS NOT NULL AND n.registration_status='registered'
+                ORDER BY n.created_at''', (branch_id,)).fetchall()
         return [{**dict(r), 'id': str(r['id']), 'gateway_id': str(r['gateway_id'])} for r in rows]
 
     return router

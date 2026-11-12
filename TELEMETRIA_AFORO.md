@@ -13,8 +13,10 @@ HLK-LD2450 --UART--> ESP32 --MQTT--> Raspberry --SQLite--> InfluxDB
                                        GET /branches/{id}/telemetry/occupancy/latest
 ```
 
-La Raspberry **no necesita cambios**: `influx_sync.event_to_line()` ya acepta
-cualquier evento numérico `data.value` y usa `event_type` como measurement.
+La Raspberry usa el mismo `influx_sync.event_to_line()` para cualquier evento
+numérico `data.value`, con `event_type` como measurement. Antes de escribir en
+InfluxDB autoriza el nodo contra el backend: solo las altas confirmadas (con
+`node_code`) envían mediciones, y la API también filtra por esos `esp_id`.
 
 ## 1. ESP32
 

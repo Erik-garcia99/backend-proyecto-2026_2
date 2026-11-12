@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from .calibrations import CalibrationError
 from .devices import iso, require_branch
 
 ROI_LIMIT = 8
@@ -98,11 +99,21 @@ def serialize_roi(row):
         'w': float(row['bbox_w']),
         'h': float(row['bbox_h']),
         'visual_capacity_units': row.get('visual_capacity_units'),
+        'calibration_status': row.get('calibration_status') or 'uncalibrated',
+        'calibration_version': row.get('calibration_version') or 0,
+        'last_calibrated_at': iso(row.get('last_calibrated_at')),
+        'calibration_invalidated_reason': row.get('calibration_invalidated_reason'),
     }
 
 
 def load_shelf(connection, branch_id, shelf_id, *, lock=False):
-    query = '''SELECT s.*, n.gateway_id AS camera_gateway_id, g.rpi_identifier
+    query = '''SELECT s.*, n.gateway_id AS camera_gateway_id, g.rpi_identifier,
+                      (SELECT c.id FROM roi_calibration_session c
+                        WHERE c.camera_node_id=s.camera_node_id
+                          AND c.state IN ('draft','empty_ready','pair_ready',
+                                          'committing','cancel_pending')
+                          AND c.expires_at > NOW()
+                        LIMIT 1) AS open_calibration_id
                FROM shelf s
                LEFT JOIN esp32_node n ON n.id=s.camera_node_id
                LEFT JOIN gateway g ON g.id=n.gateway_id AND g.is_active
@@ -197,6 +208,10 @@ def create_router(current_user, get_connection, hub):
             shelf = load_shelf(connection, branch_id, shelf_id, lock=True)
             if body.base_version != shelf['roi_version']:
                 raise HTTPException(409, 'Otra persona cambió las zonas; recarga')
+            if shelf.get('open_calibration_id'):
+                raise CalibrationError(
+                    409, 'session_conflict',
+                    'Hay una calibración abierta en esta cámara; termínala o cancélala antes de cambiar las zonas')
             _ensure_products(connection, branch['organization_id'], body.rois)
 
             existing = {row['id'] for row in connection.execute(
@@ -250,6 +265,10 @@ def create_router(current_user, get_connection, hub):
             shelf = load_shelf(connection, branch_id, shelf_id, lock=True)
             if body.version != shelf['roi_version']:
                 raise HTTPException(409, 'La versión solicitada no es la actual; recarga')
+            if shelf.get('open_calibration_id'):
+                raise CalibrationError(
+                    409, 'session_conflict',
+                    'Hay una calibración abierta en esta cámara; termínala o cancélala antes de aplicar zonas')
             rows = _active_rois(connection, shelf_id)
 
         gateway = shelf.get('rpi_identifier')
