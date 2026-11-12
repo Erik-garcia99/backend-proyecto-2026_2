@@ -110,7 +110,7 @@ class GatewayHub:
                 if not future.done():
                     future.set_result(None)
 
-    async def send(self, identifier, command, branch_token=None, payload=None):
+    async def send(self, identifier, command, branch_token=None, payload=None, timeout=None):
         session = self.sessions.get(identifier)
         if session is None:
             raise HTTPException(503, 'Raspberry desconectada; la orden no se encola')
@@ -138,7 +138,8 @@ class GatewayHub:
                 elif isinstance(payload, dict):
                     message.update(payload)
                 await session['ws'].send_json(message)
-            response = await asyncio.wait_for(future, self.timeout)
+            response = await asyncio.wait_for(
+                future, self.timeout if timeout is None else timeout)
             if response is None:
                 raise HTTPException(503, 'Conexión perdida; consulte estado antes de repetir')
             if command == 'gateway.token' and response.get('ok') is True:

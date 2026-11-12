@@ -4,9 +4,11 @@ from uuid import UUID, uuid4
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg.errors import UniqueViolation
 from . import db
+from .calibrations import CalibrationError, create_router as calibrations_router
 from .gateways import GatewayHub, create_router
 from .devices import create_router as devices_router, close_discoveries
 from .rois import create_router as rois_router
@@ -44,6 +46,15 @@ app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False,
 @app.exception_handler(PosError)
 async def pos_error_handler(_, exc):
     return pos_error_response(exc)
+
+
+@app.exception_handler(CalibrationError)
+async def calibration_error_handler(_, exc):
+    return JSONResponse(status_code=exc.status_code, content={
+        'code': exc.code,
+        'detail': exc.detail,
+        'request_id': str(uuid4()),
+    })
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -249,5 +260,6 @@ app.include_router(token_router(current_user,db.get_connection,gateway_hub))
 app.include_router(node_router(db.get_connection, gateway_hub, current_user))
 app.include_router(devices_router(current_user, db.get_connection, gateway_hub))
 app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
+app.include_router(calibrations_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
 app.include_router(pos_router(current_user, db.get_connection))

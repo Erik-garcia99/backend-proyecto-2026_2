@@ -219,6 +219,8 @@ class ShelfTests(CatalogBase):
                 return result(row=None)
             if sql.startswith('UPDATE shelf'):
                 return result(row=shelf_row(camera_node_id=DEVICE))
+            if 'FROM roi_calibration_session' in sql:
+                return result(row=None)
             raise AssertionError(sql)
 
         connection = FakeConnection(handler)
@@ -235,6 +237,8 @@ class ShelfTests(CatalogBase):
             if 'FOR UPDATE' in sql:
                 return result(row=shelf_row(camera_node_id=OTHER_DEVICE))
             if 'id<>%s' in sql:
+                return result(row=None)
+            if 'FROM roi_calibration_session' in sql:
                 return result(row=None)
             raise AssertionError(sql)
 
@@ -253,6 +257,8 @@ class ShelfTests(CatalogBase):
                 return result(row=shelf_row())
             if 'id<>%s' in sql:
                 return result(row={'id': SHELF, 'name': 'Repisa actual'})
+            if 'FROM roi_calibration_session' in sql:
+                return result(row=None)
             raise AssertionError(sql)
 
         connection = FakeConnection(handler)

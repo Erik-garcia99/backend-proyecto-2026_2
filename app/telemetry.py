@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import urlsplit
@@ -52,6 +52,7 @@ class InfluxSettings:
     occupancy_measurement: str = 'occupancy'
     occupancy_field: str = 'value'
     occupancy_stale_seconds: int = 20
+    node_ids: tuple | None = None
 
     @classmethod
     def from_env(cls):
@@ -140,12 +141,15 @@ def flux_query(settings, branch_id, measurement=None, field=None):
     measurement = settings.measurement if measurement is None else measurement
     field = settings.temperature_field if field is None else field
     q = flux_string
+    nodes = ('' if settings.node_ids is None else
+             '  |> filter(fn: (r) => contains(value: r["esp_id"], set: ['
+             + ','.join(q(str(UUID(str(n)))) for n in settings.node_ids) + ']))\n')
     return (f'from(bucket: {q(settings.bucket)})\n'
             f'  |> range(start: -{settings.lookback_hours}h)\n'
             f'  |> filter(fn: (r) => r._measurement == {q(measurement)}'
             f' and r._field == {q(field)}'
             f' and r[{q(settings.branch_tag)}] == {q(branch_id)})\n'
-            '  |> last()\n  |> group()\n  |> sort(columns: ["_time"], desc: true)\n'
+            + nodes + '  |> last()\n  |> group()\n  |> sort(columns: ["_time"], desc: true)\n'
             '  |> limit(n: 1)\n  |> keep(columns: ["_time", "_value"])')
 
 
@@ -153,9 +157,14 @@ def influxql_query(settings, branch_id, measurement=None, field=None, column='te
     # branch_id is a server-validated UUID, never free-form query input.
     measurement = settings.measurement if measurement is None else measurement
     field = settings.temperature_field if field is None else field
+    nodes = ''
+    if settings.node_ids is not None:
+        nodes = 'AND (' + ' OR '.join(
+            f'"esp_id" = \'{UUID(str(n))}\'' for n in settings.node_ids) + ') '
     return (f'SELECT {influx_identifier(field)} AS {influx_identifier(column)} '
             f'FROM {influx_identifier(measurement)} '
             f'WHERE {influx_identifier(settings.branch_tag)} = \'{UUID(str(branch_id))}\' '
+            + nodes +
             f'AND time >= now() - {settings.lookback_hours}h AND time <= now() '
             f'AND {influx_identifier(field)} >= -273.15 '
             'ORDER BY time DESC LIMIT 1')
@@ -198,6 +207,8 @@ def parse_influxql(data, column='temperature_c'):
 
 def _fetch_point(settings, branch_id, measurement, field, column):
     """Consulta el último punto (measured_at, value) o None; errores -> HTTPException."""
+    if settings.node_ids == ():
+        return None
     headers = {'Authorization': 'Token ' + settings.token}
     result = None
     try:
@@ -391,24 +402,34 @@ def create_router(current_user, get_connection):
         if not can_read_branch(user, branch):
             raise HTTPException(403, 'No tienes acceso a la telemetría de esta sucursal')
 
+    def registered_settings(branch_id):
+        with get_connection() as connection:
+            nodes = connection.execute('''SELECT n.id FROM esp32_node n
+                JOIN gateway g ON g.id=n.gateway_id
+                WHERE g.branch_id=%s AND g.is_active AND n.node_code IS NOT NULL
+                  AND n.registration_status='registered' ''', (branch_id,)).fetchall()
+        return replace(InfluxSettings.from_env(), node_ids=tuple(str(n['id']) for n in nodes))
+
     @router.get('/branches/{branch_id}/telemetry/temperature/latest', response_model=TemperatureResponse)
     def latest(branch_id: UUID, response: Response, user=Depends(current_user)):
         authorized_branch(branch_id, user)
         response.headers['Cache-Control'] = 'no-store'
-        return read_temperature(InfluxSettings.from_env(), branch_id)
+        return read_temperature(registered_settings(branch_id), branch_id)
 
     @router.get('/branches/{branch_id}/telemetry/occupancy/latest', response_model=OccupancyResponse)
     def latest_occupancy(branch_id: UUID, response: Response, user=Depends(current_user)):
         authorized_branch(branch_id, user)
         response.headers['Cache-Control'] = 'no-store'
-        return read_occupancy(InfluxSettings.from_env(), branch_id)
+        return read_occupancy(registered_settings(branch_id), branch_id)
 
     @router.get('/branches/{branch_id}/devices/{device_id}/health', response_model=HealthResponse)
     def device_health(branch_id: UUID, device_id: UUID, response: Response, user=Depends(current_user)):
         with get_connection() as connection:
             node = connection.execute(
                 '''SELECT n.id FROM esp32_node n JOIN gateway g ON g.id=n.gateway_id
-                   WHERE n.id=%s AND g.branch_id=%s''', (device_id, branch_id)).fetchone()
+                   WHERE n.id=%s AND g.branch_id=%s AND g.is_active
+                     AND n.node_code IS NOT NULL AND n.registration_status='registered' ''',
+                (device_id, branch_id)).fetchone()
         if not node:
             raise HTTPException(404, 'Dispositivo no encontrado en esta sucursal')
         authorized_branch(branch_id, user)
