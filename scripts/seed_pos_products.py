@@ -24,14 +24,29 @@ def main() -> None:
             if not branch:
                 raise SystemExit('Sucursal no encontrada')
             org_id = branch['organization_id']
+            category_names = ['Abarrotes', 'Bebidas', 'Limpieza']
+            for name in category_names:
+                conn.execute(
+                    '''INSERT INTO product_category (organization_id, name)
+                       SELECT %s, %s
+                       WHERE NOT EXISTS (
+                         SELECT 1 FROM product_category WHERE organization_id=%s AND name=%s
+                       )''',
+                    (org_id, name, org_id, name))
+            category_ids = [r['id'] for r in conn.execute(
+                '''SELECT id FROM product_category
+                   WHERE organization_id=%s AND name=ANY(%s)
+                   ORDER BY name''', (org_id, category_names)).fetchall()]
             for n in range(1, amount + 1):
                 sku = f'POS-{n:05d}'
+                category_id = category_ids[(n - 1) % len(category_ids)] if category_ids else None
                 product = conn.execute(
-                    '''INSERT INTO product (organization_id, sku, name, barcode, sale_price, tax_rate)
-                       VALUES (%s,%s,%s,%s,%s,0.16)
-                       ON CONFLICT (organization_id, barcode) DO UPDATE SET name=EXCLUDED.name
+                    '''INSERT INTO product (organization_id, sku, name, barcode, sale_price, tax_rate, category_id)
+                       VALUES (%s,%s,%s,%s,%s,0.16,%s)
+                       ON CONFLICT (organization_id, barcode) WHERE barcode IS NOT NULL
+                       DO UPDATE SET name=EXCLUDED.name, category_id=EXCLUDED.category_id
                        RETURNING id''',
-                    (org_id, sku, f'Producto de prueba {n}', sku, 10 + (n % 90))).fetchone()
+                    (org_id, sku, f'Producto de prueba {n}', sku, 10 + (n % 90), category_id)).fetchone()
                 conn.execute(
                     '''INSERT INTO branch_inventory (branch_id, product_id, quantity_on_hand)
                        VALUES (%s,%s,%s)

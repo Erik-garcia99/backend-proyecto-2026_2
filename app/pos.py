@@ -69,7 +69,7 @@ def create_router(current_user, get_connection):
 
     def product_row(cursor, product_id, org_id):
         row = cursor.execute(
-            '''SELECT id, sku, name, barcode, sale_price, tax_rate
+            '''SELECT id, sku, name, barcode, sale_price, tax_rate, is_active
                FROM product WHERE id=%s AND organization_id=%s AND is_active''',
             (product_id, org_id)).fetchone()
         if not row:
@@ -83,7 +83,7 @@ def create_router(current_user, get_connection):
             with conn.cursor() as cursor:
                 org_id = branch_org(cursor, user, branch_id)
                 rows = cursor.execute(
-                    '''SELECT id, sku, name, barcode, sale_price, tax_rate
+                    '''SELECT id, sku, name, barcode, sale_price, tax_rate, is_active
                        FROM product
                        WHERE organization_id=%s AND is_active
                          AND (%s='' OR name ILIKE %s OR sku ILIKE %s OR barcode ILIKE %s)
@@ -97,7 +97,7 @@ def create_router(current_user, get_connection):
             with conn.cursor() as cursor:
                 org_id = branch_org(cursor, user, branch_id)
                 row = cursor.execute(
-                    '''SELECT id, sku, name, barcode, sale_price, tax_rate
+                    '''SELECT id, sku, name, barcode, sale_price, tax_rate, is_active
                        FROM product
                        WHERE organization_id=%s AND is_active AND (barcode=%s OR sku=%s)
                        LIMIT 1''', (org_id, barcode, barcode)).fetchone()
