@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+
+log = logging.getLogger('selfiq.pos')
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID, uuid4
@@ -64,8 +67,39 @@ def create_router(current_user, get_connection):
         if not row:
             raise PosError(404, 'BRANCH_NOT_FOUND', 'Sucursal no encontrada.')
         if not user['is_superuser'] and str(row['organization_id']) != str(user['organization_id']):
+            # No revelar la existencia de sucursales de otra organización.
             raise PosError(404, 'BRANCH_NOT_FOUND', 'Sucursal no encontrada.')
+        # Validación por sucursal, no solo por organización.
+        role = (user.get('role') or '').lower()
+        if not user['is_superuser'] and role not in {'owner', 'gerencia'}:
+            if str(user.get('branch_id')) != str(branch_id):
+                log.warning('pos.access.denied', extra={
+                    'user_id': str(user.get('id')), 'branch_id': str(branch_id),
+                    'role': role, 'reason': 'branch_mismatch'})
+                raise PosError(403, 'FORBIDDEN', 'No tienes permiso sobre esta sucursal.')
         return row['organization_id']
+
+    POS_PERMISSIONS = {
+        'pos.product.read': {'owner', 'gerencia', 'rh', 'manager', 'employee', 'staff'},
+        'pos.inventory.read': {'owner', 'gerencia', 'rh', 'manager', 'employee', 'staff'},
+        'pos.sale.create': {'owner', 'gerencia', 'rh', 'manager', 'employee', 'staff'},
+        'pos.sale.read': {'owner', 'gerencia', 'rh', 'manager', 'employee', 'staff'},
+        'pos.sale.void': {'owner', 'gerencia', 'rh', 'manager'},
+        'pos.sale.return': {'owner', 'gerencia', 'rh', 'manager'},
+        'pos.receipt.create': {'owner', 'gerencia', 'rh', 'manager'},
+        'pos.receipt.confirm': {'owner', 'gerencia', 'rh', 'manager'},
+        'pos.inventory.adjust': {'owner', 'gerencia', 'rh', 'manager'},
+        'pos.inventory.movements.read': {'owner', 'gerencia', 'rh', 'manager', 'employee', 'staff'},
+    }
+
+    def require_action(user, action):
+        if user.get('is_superuser'):
+            return
+        role = (user.get('role') or '').lower()
+        if role not in POS_PERMISSIONS.get(action, set()):
+            log.warning('pos.permission.denied', extra={
+                'user_id': str(user.get('id')), 'role': role, 'action': action})
+            raise PosError(403, 'FORBIDDEN', 'No tienes permiso para esta acción.')
 
     def product_row(cursor, product_id, org_id):
         row = cursor.execute(
@@ -322,11 +356,6 @@ def create_router(current_user, get_connection):
             } for i in items],
         }
 
-    def require_manager(user):
-        role = (user.get('role') or '').lower()
-        if user.get('is_superuser') or role in {'owner', 'manager', 'gerencia', 'rh'}:
-            return
-        raise PosError(403, 'FORBIDDEN', 'No tienes permiso para esta acción.')
 
     def lock_inventory(cursor, branch_id, product_id):
         row = cursor.execute(
@@ -359,7 +388,7 @@ def create_router(current_user, get_connection):
 
     @router.post('/branches/{branch_id}/sales/{sale_id}/void')
     def void_sale(branch_id: UUID, sale_id: UUID, request: VoidRequest, user=Depends(current_user)):
-        require_manager(user)
+        require_action(user, 'pos.sale.void')
         with get_connection() as conn:
             with conn.cursor() as cursor:
                 try:
@@ -393,7 +422,7 @@ def create_router(current_user, get_connection):
 
     @router.post('/branches/{branch_id}/sales/{sale_id}/returns')
     def return_sale(branch_id: UUID, sale_id: UUID, request: ReturnRequest, user=Depends(current_user)):
-        require_manager(user)
+        require_action(user, 'pos.sale.return')
         with get_connection() as conn:
             with conn.cursor() as cursor:
                 try:
@@ -434,7 +463,7 @@ def create_router(current_user, get_connection):
     def adjust_inventory(branch_id: UUID, request: AdjustmentRequest,
                          idempotency_key: str = Header(..., alias='Idempotency-Key'),
                          user=Depends(current_user)):
-        require_manager(user)
+        require_action(user, 'pos.inventory.adjust')
         digest = _body_hash(request.model_dump(mode='json'))
         with get_connection() as conn:
             with conn.cursor() as cursor:
@@ -487,7 +516,7 @@ def create_router(current_user, get_connection):
 
     @router.post('/branches/{branch_id}/goods-receipts', status_code=201)
     def create_receipt(branch_id: UUID, request: GoodsReceiptCreate, user=Depends(current_user)):
-        require_manager(user)
+        require_action(user, 'pos.receipt.create')
         with get_connection() as conn:
             with conn.cursor() as cursor:
                 try:
@@ -521,7 +550,7 @@ def create_router(current_user, get_connection):
 
     @router.post('/branches/{branch_id}/goods-receipts/{receipt_id}/confirm')
     def confirm_receipt(branch_id: UUID, receipt_id: UUID, user=Depends(current_user)):
-        require_manager(user)
+        require_action(user, 'pos.receipt.confirm')
         with get_connection() as conn:
             with conn.cursor() as cursor:
                 try:
