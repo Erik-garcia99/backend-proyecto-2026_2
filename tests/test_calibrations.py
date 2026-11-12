@@ -867,6 +867,11 @@ class MutationRouteTests(CalibrationBase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()['state'], 'cancel_pending')
         dispatch.assert_awaited_once()
+        update = next(call for call in connection.calls
+                      if call[0].startswith('UPDATE roi_calibration_session')
+                      and 'state=%s' in call[0])
+        self.assertIn('expires_at=LEAST(expires_at, NOW() + %s)', update[0])
+        self.assertEqual(update[1][1], calibrations.CANCEL_GRACE)
 
     def test_cancel_committing_is_invalid_state(self):
         connection = FakeConnection(self.handler(
@@ -877,6 +882,18 @@ class MutationRouteTests(CalibrationBase):
             headers={'Idempotency-Key': 'cancel-2'})
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()['code'], 'invalid_state')
+
+    def test_cancel_retry_does_not_extend_deadline(self):
+        connection = FakeConnection(self.handler(
+            session=session_row(state='cancel_pending', session_version=4)))
+        with patch.object(calibrations, 'dispatch_operation', AsyncMock()):
+            response = self.client(connection, FakeHub()).post(
+                f'/branches/{BRANCH}/rois/{ROI}/calibrations/{CAL}/cancel',
+                json={'session_version': 4},
+                headers={'Idempotency-Key': 'cancel-retry'})
+        self.assertEqual(response.status_code, 202)
+        self.assertFalse(any('expires_at=' in sql for sql, _ in connection.calls
+                             if 'state=\'expired\'' not in sql))
 
     def test_cancel_terminal_returns_200_without_new_operation(self):
         connection = FakeConnection(self.handler(
@@ -1088,6 +1105,83 @@ class DispatchTests(unittest.TestCase):
         session_update = next(call for call in connection.calls
                               if call[0].startswith('UPDATE roi_calibration_session'))
         self.assertIn('cancelled', session_update[1])
+
+    def test_cancel_rejection_closes_session_and_frees_camera(self):
+        operation = operation_row(action='cancel', status='sent', payload={})
+        session = self.session(state='cancel_pending', session_version=5)
+        hub = FakeHub(result={'type': 'result', 'id': str(operation['id']),
+                              'ok': False, 'error': {'code': 'invalid_request'}})
+
+        def handle(sql, params):
+            if 'FROM calibration_operation WHERE id=%s' in sql and 'FOR UPDATE' not in sql:
+                return result(row=operation)
+            if 'FROM roi_calibration_session WHERE id=%s' in sql:
+                return result(row=session)
+            if 'FROM esp32_node' in sql:
+                return result(row={'rpi_identifier': 'rpi-1'})
+            if sql.startswith('UPDATE calibration_operation') and "status='sent'" in sql:
+                return result()
+            if 'FOR UPDATE' in sql and 'FROM calibration_operation' in sql:
+                return result(row={**operation, 'status': 'sent'})
+            if 'FOR UPDATE' in sql and 'FROM roi_calibration_session' in sql:
+                return result(row=session)
+            if sql.startswith('UPDATE roi_calibration_session'):
+                return result(row={**session, 'state': 'failed'})
+            if sql.startswith('UPDATE calibration_operation'):
+                return result()
+            raise AssertionError(sql)
+
+        connection = FakeConnection(handle)
+        asyncio.run(calibrations.dispatch_operation(connection_provider(connection), hub,
+                                                    operation['id']))
+        update = next(call for call in connection.calls
+                      if call[0].startswith('UPDATE roi_calibration_session'))
+        self.assertIn('state=%s', update[0])
+        self.assertEqual(update[1][0], 'failed')
+        self.assertIn('closed_at=NOW()', update[0])
+        self.assertIn('error_code=%s', update[0])
+        self.assertEqual(update[1][-2], 'invalid_request')
+        rejected = [call for call in connection.calls
+                    if call[0].startswith('UPDATE calibration_operation') and
+                    'status=%s' in call[0]]
+        self.assertEqual(rejected[-1][1][0], 'rejected')
+
+    def test_cancel_ack_without_cancelled_status_closes_session(self):
+        operation = operation_row(action='cancel', status='sent', payload={})
+        session = self.session(state='cancel_pending', session_version=5)
+        connection = FakeConnection(
+            lambda sql, params: result(row={**session, 'state': 'failed'}))
+        calibrations.apply_cancel_ack(
+            connection, operation, session,
+            {'status': 'failed', 'code': 'cancel_failed'})
+        update = next(call for call in connection.calls
+                      if call[0].startswith('UPDATE roi_calibration_session'))
+        self.assertEqual(update[1][0], 'failed')
+        self.assertIn('closed_at=NOW()', update[0])
+        self.assertEqual(update[1][-2], 'cancel_failed')
+
+    def test_cancel_transport_failure_does_not_renew_expiry(self):
+        for unknown in (True, False):
+            with self.subTest(unknown=unknown):
+                operation = operation_row(action='cancel', status='sent')
+                session = self.session(state='cancel_pending')
+                def handle(sql, params):
+                    if sql.startswith('SELECT * FROM calibration_operation'):
+                        return result(row=operation)
+                    if sql.startswith('SELECT * FROM roi_calibration_session'):
+                        return result(row=session)
+                    return result(row=session)
+                connection = FakeConnection(handle)
+                calibrations.apply_dispatch_failure(
+                    connection_provider(connection), operation['id'],
+                    'node_timeout' if unknown else 'gateway_offline', unknown=unknown)
+                update = next(call for call in connection.calls
+                              if call[0].startswith('UPDATE roi_calibration_session'))
+                self.assertNotIn('expires_at=', update[0])
+                self.assertEqual('closed_at=NOW()' in update[0], not unknown)
+                self.assertEqual('state=%s' in update[0], not unknown)
+                if not unknown:
+                    self.assertEqual(update[1][0], 'failed')
 
     def test_commit_ack_activates_and_updates_roi(self):
         operation = operation_row(action='commit', status='sent', payload={
