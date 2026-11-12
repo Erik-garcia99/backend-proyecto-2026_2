@@ -10,6 +10,7 @@ from . import db
 from .gateways import GatewayHub, create_router
 from .devices import create_router as devices_router, close_discoveries
 from .rois import create_router as rois_router
+from .pos import PosError, create_router as pos_router, error_response as pos_error_response
 from .node_registration import make_router as node_router
 from .telemetry import create_router as telemetry_router
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
@@ -37,7 +38,13 @@ async def lifespan(_):
 app = FastAPI(title='SelfIQ API', version='2.0.0', lifespan=lifespan)
 app.state.gateway_hub = gateway_hub
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False,
-                   allow_methods=['*'], allow_headers=['*'])
+                   allow_methods=['*'], allow_headers=['*'],
+                   expose_headers=['X-Captured-At'])
+
+@app.exception_handler(PosError)
+async def pos_error_handler(_, exc):
+    return pos_error_response(exc)
+
 bearer = HTTPBearer(auto_error=False)
 
 def user_response(user):
@@ -243,3 +250,4 @@ app.include_router(node_router(db.get_connection, gateway_hub, current_user))
 app.include_router(devices_router(current_user, db.get_connection, gateway_hub))
 app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
+app.include_router(pos_router(current_user, db.get_connection))
