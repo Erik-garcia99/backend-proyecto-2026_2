@@ -51,6 +51,39 @@ class SaleItemOut(BaseModel):
     subtotal: Decimal
 
 
+class VoidRequest(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class ReturnItem(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    product_id: UUID
+    quantity: int = Field(gt=0, le=100000)
+
+
+class ReturnRequest(BaseModel):
+    items: list[ReturnItem] = Field(min_length=1)
+    reason: str | None = Field(default=None, max_length=500)
+
+
+class AdjustmentRequest(BaseModel):
+    product_id: UUID
+    quantity_delta: int = Field(ne=0)
+    reason: str = Field(min_length=3, max_length=500)
+
+
+class GoodsReceiptItem(BaseModel):
+    product_id: UUID
+    declared_units: int = Field(default=0, ge=0)
+    received_units: int = Field(gt=0)
+
+
+class GoodsReceiptCreate(BaseModel):
+    supplier_id: UUID | None = None
+    notes: str | None = Field(default=None, max_length=500)
+    items: list[GoodsReceiptItem] = Field(min_length=1)
+
+
 class SaleOut(BaseModel):
     id: UUID
     sale_number: str
