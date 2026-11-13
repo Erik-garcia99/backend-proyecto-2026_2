@@ -50,7 +50,12 @@ def create_router(current_user, get_connection, hub):
         except Exception as exc:
             raise HTTPException(503, f'No se pudo aplicar el ajuste en el nodo: {exc}') from exc
 
-        if not result or result.get('occupancy_adjusted') is not True:
+        if not result or result.get('ok') is not True:
+            raise HTTPException(502, (result or {}).get('error')
+                                or 'El nodo no confirmó el ajuste de aforo')
+
+        data = result.get('data') if isinstance(result.get('data'), dict) else {}
+        if data.get('occupancy_adjusted') is not True or data.get('node_id') != str(body.node_id):
             raise HTTPException(502, 'El nodo no confirmó el ajuste de aforo')
 
         # Registrar auditoría (best-effort: si la tabla no existe, no bloquea el ajuste).
