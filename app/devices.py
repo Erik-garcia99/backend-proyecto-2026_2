@@ -709,9 +709,25 @@ def create_router(current_user, get_connection, hub):
                 (gateway_id, branch_id)).fetchone()
         if not gateway:
             raise HTTPException(404, 'Equipo principal no registrado en esta sucursal')
-        if gateway_id in _starting_gateways or any(
-                s['gateway_id'] == gateway_id and not s.get('stopped')
-                and time.time() < s['expires_at'] + 60 for s in _discoveries.values()):
+        # Retira sesiones expiradas y reemplaza búsquedas activas anteriores del
+        # mismo equipo. Evita que una búsqueda previa (o una que el usuario cerró
+        # sin detener) bloquee indefinidamente el inicio de una nueva, lo que
+        # obligaba a reiniciar el servicio del gateway.
+        now = time.time()
+        for key, session in tuple(_discoveries.items()):
+            if session.get('gateway_id') != gateway_id or session.get('branch_id') != branch_id:
+                continue
+            if session.get('stopped') or now >= session.get('expires_at', 0):
+                _discoveries.pop(key, None)
+                continue
+            session['stopped'] = True
+            _discoveries.pop(key, None)
+            try:
+                await hub.send(gateway_id, 'tcp.disable')
+            except Exception:
+                logging.getLogger(__name__).debug(
+                    'No se pudo cerrar la búsqueda anterior del gateway', exc_info=True)
+        if gateway_id in _starting_gateways:
             raise HTTPException(409, 'Ya hay una búsqueda activa en este equipo; espera a que termine')
         _starting_gateways.add(gateway_id)
         try:
