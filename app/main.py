@@ -13,9 +13,9 @@ from .gateways import GatewayHub, create_router
 from .devices import create_router as devices_router, close_discoveries
 from .rois import create_router as rois_router
 from .node_registration import make_router as node_router
-from .telemetry import create_router as telemetry_router
+from .telemetry import (create_router as telemetry_router, read_occupancy, InfluxSettings, replace)
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
-from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerRegisterRequest, LoginRequest,
+from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerHomeResponse, CustomerRegisterRequest, LoginRequest,
                       LoginResponse, MessageResponse, NotificationPreferences,
                       NotificationPreferencesUpdate, PasswordChangeRequest, PendingUserResponse,
                       ProfileUpdateRequest, RegisterRequest, RegisterResponse, UserResponse)
@@ -298,3 +298,27 @@ app.include_router(devices_router(current_user, db.get_connection, gateway_hub))
 app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(calibrations_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
+
+@app.get('/customer/home', response_model=CustomerHomeResponse)
+def customer_home(branch_id: UUID, user=Depends(current_user)):
+    if user['role'].lower() != 'customer' and not user['is_superuser']:
+        raise HTTPException(403, 'Solo los clientes consultan el aforo desde la app')
+    with db.get_connection() as connection:
+        branch = connection.execute('''SELECT b.id, b.name, b.organization_id
+                FROM branch b JOIN organization o ON o.id=b.organization_id
+                WHERE b.id=%s AND b.is_active AND o.is_active''', (branch_id,)).fetchone()
+        if not branch:
+            raise HTTPException(404, 'Sucursal no encontrada o inactiva')
+        if not user['is_superuser'] and branch['organization_id'] != user['organization_id']:
+            raise HTTPException(403, 'No tienes acceso a esta sucursal')
+        nodes = connection.execute('''SELECT n.id FROM esp32_node n
+                JOIN gateway g ON g.id=n.gateway_id
+                WHERE g.branch_id=%s AND g.is_active AND n.node_code IS NOT NULL
+                  AND n.registration_status='registered' ''', (branch_id,)).fetchall()
+    settings = replace(InfluxSettings.from_env(), node_ids=tuple(str(n['id']) for n in nodes))
+    occupancy = read_occupancy(settings, branch_id)
+    return CustomerHomeResponse(branch_id=str(branch['id']), branch_name=branch['name'],
+                               occupancy=occupancy.occupancy, measured_at=occupancy.measured_at,
+                               age_seconds=occupancy.age_seconds,
+                               stale_after_seconds=occupancy.stale_after_seconds,
+                               status=occupancy.status, has_catalog=True)

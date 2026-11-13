@@ -31,6 +31,17 @@ class CustomerRegisterRequest(BaseModel):
     organization_slug: str | None = Field(default=None, max_length=100)
 
 
+class CustomerHomeResponse(BaseModel):
+    branch_id: str
+    branch_name: str
+    occupancy: int | None
+    measured_at: datetime | None
+    age_seconds: int | None
+    stale_after_seconds: int
+    status: str
+    has_catalog: bool = True
+
+
 class LoginRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320, pattern=EMAIL_PATTERN)
     password: str
