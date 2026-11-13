@@ -9,3 +9,8 @@ load_dotenv(Path(__file__).resolve().parent.parent / '.env', override=False)
 DATABASE_URL = os.environ["DATABASE_URL"]
 JWT_SECRET = os.environ["JWT_SECRET"]
 JWT_ALGORITHM = "HS256"
+
+# Organización por defecto para el autorregistro de clientes. Si está vacía y
+# solo existe una organización activa, el endpoint la usa; si hay varias,
+# exige `organization_slug` en la solicitud.
+CUSTOMER_ORGANIZATION_SLUG = os.getenv("CUSTOMER_ORGANIZATION_SLUG", "").strip()

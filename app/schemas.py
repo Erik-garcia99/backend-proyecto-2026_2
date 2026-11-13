@@ -19,6 +19,18 @@ class RegisterRequest(BaseModel):
     registration_token: str = Field(min_length=1, max_length=255)
 
 
+class CustomerRegisterRequest(BaseModel):
+    """Alta de cliente final. `role` no se acepta: si llega, Pydantic responde 422."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+
+    email: str = Field(min_length=3, max_length=320, pattern=EMAIL_PATTERN)
+    password: str = Field(min_length=8, max_length=128)
+    first_name: str = Field(min_length=1, max_length=100)
+    last_name: str = Field(min_length=1, max_length=100)
+    phone: str | None = Field(default=None, max_length=30)
+    organization_slug: str | None = Field(default=None, max_length=100)
+
+
 class LoginRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320, pattern=EMAIL_PATTERN)
     password: str

@@ -15,10 +15,11 @@ from .rois import create_router as rois_router
 from .node_registration import make_router as node_router
 from .telemetry import create_router as telemetry_router
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
-from .schemas import (BranchCreateRequest, BranchCreatedResponse, LoginRequest, LoginResponse,
-                      MessageResponse, NotificationPreferences, NotificationPreferencesUpdate,
-                      PasswordChangeRequest, PendingUserResponse, ProfileUpdateRequest, RegisterRequest,
-                      RegisterResponse, UserResponse)
+from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerRegisterRequest, LoginRequest,
+                      LoginResponse, MessageResponse, NotificationPreferences,
+                      NotificationPreferencesUpdate, PasswordChangeRequest, PendingUserResponse,
+                      ProfileUpdateRequest, RegisterRequest, RegisterResponse, UserResponse)
+from .config import CUSTOMER_ORGANIZATION_SLUG
 from .security import (create_access_token, decode_access_token, hash_password,
                        hash_registration_token, verify_password, generate_registration_token)
 
@@ -59,6 +60,26 @@ def user_response(user):
         role=user['role'], organization_id=str(user['organization_id']),
         branch_id=str(user['branch_id']) if user['branch_id'] else None)
 
+def customer_organization(connection, requested_slug):
+    """Resuelve la organización del cliente sin atarlo a una sucursal.
+
+    Orden: slug enviado por el cliente -> CUSTOMER_ORGANIZATION_SLUG -> única
+    organización activa. Con varias organizaciones y sin slug, se rechaza para
+    no registrar al cliente en la tienda equivocada.
+    """
+    slug = (requested_slug or CUSTOMER_ORGANIZATION_SLUG or '').strip()
+    if slug:
+        row = connection.execute('SELECT id FROM organization WHERE slug=%s AND is_active', (slug,)).fetchone()
+        if not row:
+            raise HTTPException(400, 'La organización indicada no existe o está inactiva')
+        return row['id']
+    rows = connection.execute('SELECT id FROM organization WHERE is_active ORDER BY created_at LIMIT 2').fetchall()
+    if len(rows) == 1:
+        return rows[0]['id']
+    if not rows:
+        raise HTTPException(503, 'No hay una organización activa para registrar clientes')
+    raise HTTPException(400, 'El registro de clientes requiere indicar organization_slug')
+
 @app.get('/health')
 def health():
     return {'status': 'ok'}
@@ -90,6 +111,28 @@ def register(request: RegisterRequest):
             connection.rollback()
             raise HTTPException(409,'El correo ya está registrado')
     return RegisterResponse(message='Cuenta creada; queda pendiente de aprobación',user_id=str(user['id']),account_status='PENDING_APPROVAL')
+
+@app.post('/auth/customer-register', response_model=RegisterResponse, status_code=201)
+def customer_register(request: CustomerRegisterRequest):
+    """Autorregistro de cliente: activo de inmediato y sin sucursal fija.
+
+    El cliente queda ligado a la organización (para poder listar sus sucursales
+    después), pero `branch_id` se guarda NULL: no pertenece a una tienda.
+    """
+    with db.get_connection() as connection:
+        organization_id = customer_organization(connection, request.organization_slug)
+        try:
+            user = connection.execute('''INSERT INTO "user" (organization_id,branch_id,email,first_name,last_name,
+                phone_number,password_hash,role,account_status)
+                VALUES(%s,NULL,%s,%s,%s,%s,%s,'customer','active') RETURNING id''',
+                (organization_id,request.email.lower(),request.first_name,request.last_name,
+                 request.phone,hash_password(request.password))).fetchone()
+            connection.commit()
+        except UniqueViolation:
+            connection.rollback()
+            raise HTTPException(409,'El correo ya está registrado')
+    return RegisterResponse(message='Cuenta de cliente creada; ya puedes iniciar sesión',
+                            user_id=str(user['id']),account_status='ACTIVE')
 
 @app.post('/auth/login', response_model=LoginResponse)
 def login(request: LoginRequest):
