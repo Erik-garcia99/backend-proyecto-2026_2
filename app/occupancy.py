@@ -100,4 +100,3 @@ def create_router(current_user, get_connection, hub):
         ]
 
     return router
-PY

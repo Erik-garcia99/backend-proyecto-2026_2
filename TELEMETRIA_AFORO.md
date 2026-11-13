@@ -1,7 +1,10 @@
 # Aforo: LD2450 → ESP32 → MQTT → RPI → InfluxDB → API
 
-Esta integración publica el **aforo instantáneo** (personas dentro de la zona de
-la puerta) y lo expone al backend. El frontend queda para la siguiente fase.
+Esta integración publica la **presencia instantánea** en la zona de la puerta
+(hasta 3 objetivos simultáneos que el LD2450 puede detectar a la vez) y la
+expone al backend. **No es el aforo de la tienda**: el aforo de negocio
+(personas dentro) se calcula por cruces de entrada/salida, más ajustes manuales.
+El frontend queda para la siguiente fase.
 
 ## Flujo
 
@@ -36,9 +39,13 @@ una muestra aunque el valor no cambie. Así el backend distingue "sigue en 0" de
 }
 ```
 
-`data.value` es `ld2450_occupancy()`: conteo estable `0..3` dentro de la ROI,
-con debounce de 5 frames (~0.5 s). No es un contador acumulado; es el aforo
-actual. Entradas/salidas acumuladas requieren el tracker con cruce de línea.
+`data.value` es `ld2450_occupancy()`: conteo estable `0..3` de objetivos
+presentes en la ROI en ese instante, con debounce de 5 frames (~0.5 s).
+**Es presencia instantánea en la zona del radar, no el aforo de la tienda.**
+El LD2450 solo detecta hasta 3 objetivos a la vez, por lo que este valor no
+puede representar la ocupación total del comercio. El aforo de negocio
+(personas dentro) se obtiene de los eventos `entry`/`exit` (cruces de línea),
+acumulados en NVS y ajustables manualmente; ver `PLAN_AFORO_LD2450.md` §1 y §3.4.
 
 Para cambiar la frecuencia, edita `LD2450_TELEMETRY_INTERVAL_MS`. Ten en cuenta
 F-05: el conteo debe reflejarse en <= 2 s, así que no conviene subirlo de 2000 ms.
@@ -117,7 +124,12 @@ measurement `occupancy`.
 
 ## Alcance
 
-- Se implementa solo la lectura del aforo actual para el backend.
-- Entradas/salidas acumuladas, histórico y tarjeta de frontend quedan pendientes.
+- Se implementa la lectura de la **presencia instantánea** (0..3 objetivos en la
+  ROI) para el backend. No representa el aforo de la tienda.
+- El **aforo de negocio** (personas dentro) se gestiona por eventos `entry`/`exit`
+  (cruces de línea), acumulados en NVS y ajustables manualmente vía
+  `POST /branches/{branch}/occupancy/adjustments` (gateway `occupancy.adjust`).
+- Entradas/salidas acumuladas, histórico por franja y tarjeta de frontend quedan
+  pendientes (A6 del plan de aforo).
 - El LD2450 no identifica personas; con varias personas cruzando a la vez el
   conteo instantáneo puede oscilar. El tracker con línea e histéresis corrige eso.
