@@ -14,6 +14,7 @@ from .devices import create_router as devices_router, close_discoveries
 from .rois import create_router as rois_router
 from .node_registration import make_router as node_router
 from .telemetry import create_router as telemetry_router
+from .occupancy import create_router as occupancy_router
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, LoginRequest, LoginResponse,
                       MessageResponse, NotificationPreferences, NotificationPreferencesUpdate,
@@ -255,3 +256,4 @@ app.include_router(devices_router(current_user, db.get_connection, gateway_hub))
 app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(calibrations_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
+app.include_router(occupancy_router(current_user, db.get_connection, gateway_hub))
