@@ -16,21 +16,21 @@
 --   - El SQL Editor guarda historial: no uses una contraseña que reutilices.
 --
 -- Cómo usarlo:
---   1. Ejecuta la consulta de descubrimiento para copiar organization.slug
---      y branch.branch_code (o los UUID).
+--   1. Ejecuta la consulta de descubrimiento para copiar organization.slug.
 --   2. Edita las constantes del bloque DO.
 --   3. Ejecuta el bloque completo.
 --   4. Verifica con la consulta final y prueba el login contra Railway.
+--
+-- Nota (D-C16): el cliente NO pertenece a una sucursal; se guarda
+-- branch_id = NULL y solo se liga a la organización.
 
 -- ============================================================
 -- 1) DESCUBRIMIENTO: ejecuta esto aparte y copia los valores
 -- ============================================================
--- select o.id as organization_id, o.name as organization_name, o.slug,
---        b.id as branch_id, b.name as branch_name, b.branch_code
---   from public.organization o
---   join public.branch b on b.organization_id = o.id
---  where o.is_active and b.is_active
---  order by o.name, b.name;
+-- select id as organization_id, name as organization_name, slug
+--   from public.organization
+--  where is_active
+--  order by name;
 
 -- ============================================================
 -- 2) ALTA DEL CLIENTE: edita las constantes y ejecuta
@@ -47,11 +47,7 @@ declare
   v_last_name    text := 'Demo';
   v_phone        text := null;          -- opcional
   v_org_slug     text := 'selfiq';      -- organization.slug
-  v_branch_code  text := 'SUC-001';     -- branch.branch_code
-  -- Si tu sucursal no tiene branch_code, deja v_branch_code en null y pega
-  -- el UUID en v_branch_id (lo obtienes del descubrimiento).
   v_org_id       uuid := null;          -- opcional: UUID directo
-  v_branch_id    uuid := null;          -- opcional: UUID directo
   -- ======================
 
   v_role         text;
@@ -78,26 +74,7 @@ begin
     raise exception 'No existe una organización activa con slug = %.', v_org_slug;
   end if;
 
-  -- Sucursal
-  if v_branch_id is null then
-    select id into v_branch_id
-      from public.branch
-     where organization_id = v_org_id
-       and branch_code = v_branch_code
-       and is_active;
-  else
-    perform 1 from public.branch
-     where id = v_branch_id and organization_id = v_org_id and is_active;
-    if not found then
-      raise exception 'La sucursal % no existe, está inactiva o no pertenece a la organización.', v_branch_id;
-    end if;
-  end if;
-
-  if v_branch_id is null then
-    raise exception 'No existe una sucursal activa con branch_code = % en la organización %.', v_branch_code, v_org_slug;
-  end if;
-
-  -- Alta o actualización
+  -- Alta o actualización (D-C16: el cliente no pertenece a una sucursal)
   select id, role into v_user_id, v_role
     from public."user"
    where lower(email) = v_email;
@@ -107,7 +84,7 @@ begin
       organization_id, branch_id, email, first_name, last_name, phone_number,
       role, account_status, password_hash, deactivated_at
     ) values (
-      v_org_id, v_branch_id, v_email, v_first_name, v_last_name, v_phone,
+      v_org_id, null, v_email, v_first_name, v_last_name, v_phone,
       'customer', 'active', crypt(v_password, gen_salt('bf', 12)), null
     )
     returning id into v_user_id;
@@ -119,7 +96,7 @@ begin
 
     update public."user"
        set organization_id = v_org_id,
-           branch_id = v_branch_id,
+           branch_id = null,
            first_name = v_first_name,
            last_name = v_last_name,
            phone_number = v_phone,

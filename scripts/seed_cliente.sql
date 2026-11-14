@@ -4,12 +4,19 @@
 -- repisas, ROIs, mapa, un nodo de guía LED simulado y ventas de ejemplo.
 -- Es idempotente: se puede ejecutar varias veces y deja el mismo estado.
 --
+-- Funciona en psql y en el SQL Editor de Supabase (no usa comandos "\").
+--
 -- Requisitos:
 --   1. Extensión pgcrypto disponible (Supabase la incluye; si no, ver nota abajo).
---   2. Pasar la contraseña de prueba por variable, nunca en el archivo:
+--   2. Editar la contraseña de prueba en la línea marcada "EDITA AQUÍ".
+--      No uses una contraseña real ni reutilizada: el SQL Editor guarda historial.
 --
---        psql "$DATABASE_URL" -v test_password='TuPasswordDePrueba' \
---          -f backend-proyecto-2026_2/scripts/seed_cliente.sql
+-- Uso en Supabase:
+--   SQL Editor → New query → pegar todo este archivo → Run.
+--
+-- Uso local con psql:
+--
+--        psql "$DATABASE_URL" -f backend-proyecto-2026_2/scripts/seed_cliente.sql
 --
 --   Todos los usuarios de QA usan la misma contraseña de prueba.
 --
@@ -24,18 +31,8 @@
 --   gateway       c1e00000-0000-4000-8000-000000000003
 --   nodo guía     c1e00000-0000-4000-8000-000000000004
 
-\set ON_ERROR_STOP on
-
-\if :{?test_password}
-\else
-  \echo 'ERROR: falta la variable test_password.'
-  \echo 'Uso: psql "$DATABASE_URL" -v test_password=''...'' -f scripts/seed_cliente.sql'
-  \quit
-\endif
-
-SELECT set_config('selfiq.test_password', :'test_password', false);
-
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+SET search_path = public, extensions;
 
 BEGIN;
 
@@ -91,8 +88,11 @@ DECLARE
     v_item_ok_2        uuid := 'c1e00000-0000-4000-8000-000000000412';
     v_item_void        uuid := 'c1e00000-0000-4000-8000-000000000413';
 
-    v_pw               text := current_setting('selfiq.test_password');
+    v_pw               text := 'CambiaEstaPassword123';  -- EDITA AQUÍ: contraseña de prueba (mín. 8)
 BEGIN
+    IF v_pw = 'cc0P;x?QLfNw' THEN
+        RAISE EXCEPTION 'Edita la contraseña de prueba en el seed antes de ejecutarlo.';
+    END IF;
     IF v_pw IS NULL OR length(v_pw) < 8 THEN
         RAISE EXCEPTION 'La contraseña de prueba debe tener al menos 8 caracteres.';
     END IF;
@@ -124,11 +124,11 @@ BEGIN
            updated_at = NOW();
 
     -- Usuarios ----------------------------------------------------------------
-    -- cli_a: cliente principal de pruebas
+    -- cli_a: cliente principal de pruebas (D-C16: sin sucursal)
     INSERT INTO public."user" (id, organization_id, branch_id, email, first_name,
                                last_name, phone_number, role, account_status,
                                password_hash, deactivated_at)
-    VALUES (v_cli_a, v_org, v_branch, 'cli_a@selfiq.test', 'Cliente', 'A',
+    VALUES (v_cli_a, v_org, NULL, 'cli_a@selfiq.test', 'Cliente', 'A',
             '6640000001', 'customer', 'active',
             crypt(v_pw, gen_salt('bf', 12)), NULL)
     ON CONFLICT (id) DO UPDATE
@@ -144,11 +144,11 @@ BEGIN
            deactivated_at = NULL,
            updated_at = NOW();
 
-    -- cli_b: aislamiento entre clientes
+    -- cli_b: aislamiento entre clientes (D-C16: sin sucursal)
     INSERT INTO public."user" (id, organization_id, branch_id, email, first_name,
                                last_name, phone_number, role, account_status,
                                password_hash, deactivated_at)
-    VALUES (v_cli_b, v_org, v_branch, 'cli_b@selfiq.test', 'Cliente', 'B',
+    VALUES (v_cli_b, v_org, NULL, 'cli_b@selfiq.test', 'Cliente', 'B',
             '6640000002', 'customer', 'active',
             crypt(v_pw, gen_salt('bf', 12)), NULL)
     ON CONFLICT (id) DO UPDATE
@@ -164,11 +164,11 @@ BEGIN
            deactivated_at = NULL,
            updated_at = NOW();
 
-    -- cli_baja: baja lógica, no puede iniciar sesión
+    -- cli_baja: baja lógica, no puede iniciar sesión (D-C16: sin sucursal)
     INSERT INTO public."user" (id, organization_id, branch_id, email, first_name,
                                last_name, phone_number, role, account_status,
                                password_hash, deactivated_at)
-    VALUES (v_cli_baja, v_org, v_branch, 'cli_baja@selfiq.test', 'Cliente', 'Baja',
+    VALUES (v_cli_baja, v_org, NULL, 'cli_baja@selfiq.test', 'Cliente', 'Baja',
             '6640000003', 'customer', 'inactive',
             crypt(v_pw, gen_salt('bf', 12)), NOW())
     ON CONFLICT (id) DO UPDATE
@@ -607,9 +607,7 @@ $$;
 
 COMMIT;
 
-SELECT set_config('selfiq.test_password', '', false);
-
-\echo '--- Resumen del entorno QA ---'
+-- Resumen del entorno QA
 SELECT 'usuarios' AS grupo, count(*) AS total
   FROM public."user" WHERE organization_id = 'c1e00000-0000-4000-8000-000000000001'
 UNION ALL
@@ -622,5 +620,5 @@ UNION ALL
 SELECT 'ventas', count(*)
   FROM public.sale WHERE branch_id = 'c1e00000-0000-4000-8000-000000000002';
 
-\echo 'Usuarios QA: cli_a, cli_b, cli_baja, caja, enc @selfiq.test (misma contraseña de prueba).'
-\echo 'Productos QA: P-OK, P-BAJO, P-AGOT, P-SINROI, P-INACT, P-LED, P-SINLED.'
+-- Usuarios QA: cli_a, cli_b, cli_baja, caja, enc @selfiq.test (misma contraseña de prueba).
+-- Productos QA: P-OK, P-BAJO, P-AGOT, P-SINROI, P-INACT, P-LED, P-SINLED.
