@@ -14,3 +14,7 @@ JWT_ALGORITHM = "HS256"
 # solo existe una organización activa, el endpoint la usa; si hay varias,
 # exige `organization_slug` en la solicitud.
 CUSTOMER_ORGANIZATION_SLUG = os.getenv("CUSTOMER_ORGANIZATION_SLUG", "").strip()
+
+# Auth: duración de tokens
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))

@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Response
@@ -16,12 +17,14 @@ from .node_registration import make_router as node_router
 from .telemetry import (create_router as telemetry_router, read_occupancy, InfluxSettings, replace)
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerHomeResponse, CustomerRegisterRequest, LoginRequest,
-                      LoginResponse, MessageResponse, NotificationPreferences,
+                      LoginResponse, LogoutRequest, MessageResponse, NotificationPreferences,
                       NotificationPreferencesUpdate, PasswordChangeRequest, PendingUserResponse,
-                      ProfileUpdateRequest, RegisterRequest, RegisterResponse, UserResponse)
-from .config import CUSTOMER_ORGANIZATION_SLUG
+                      ProfileUpdateRequest, RefreshRequest, RefreshResponse,
+                      RegisterRequest, RegisterResponse, UserResponse)
+from .config import CUSTOMER_ORGANIZATION_SLUG, ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 from .security import (create_access_token, decode_access_token, hash_password,
-                       hash_registration_token, verify_password, generate_registration_token)
+                       hash_registration_token, verify_password, generate_registration_token,
+                       generate_refresh_token, hash_refresh_token, needs_rehash)
 
 gateway_hub = GatewayHub(db.get_connection,
     validate_token=lambda branch_id, digest: validate_branch_token(db.get_connection, branch_id, digest))
@@ -142,7 +145,47 @@ def login(request: LoginRequest):
         raise HTTPException(401,'Credenciales incorrectas')
     if user['deactivated_at'] is not None or user['account_status']!='active':
         raise HTTPException(403,'La cuenta no está activa o aprobada')
-    return LoginResponse(access_token=create_access_token(str(user['id'])),user=user_response(user))
+    # Rehash transparente bcrypt → Argon2id (D-C15).
+    if needs_rehash(user['password_hash']):
+        new_hash = hash_password(request.password)
+        with db.get_connection() as connection:
+            connection.execute('UPDATE "user" SET password_hash=%s, updated_at=NOW() WHERE id=%s',
+                (new_hash, user['id']))
+            connection.commit()
+    # Crear sesión con refresh token (D-C3).
+    refresh_token = generate_refresh_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    with db.get_connection() as connection:
+        connection.execute('''INSERT INTO auth_session (user_id, refresh_token_hash, platform,
+            device_label, expires_at) VALUES (%s, %s, %s, %s, %s)''',
+            (user['id'], hash_refresh_token(refresh_token), None, None, expires_at))
+        connection.commit()
+    return LoginResponse(access_token=create_access_token(str(user['id'])),
+                         refresh_token=refresh_token,
+                         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+                         user=user_response(user))
+
+@app.post('/auth/refresh', response_model=RefreshResponse)
+def refresh(request: RefreshRequest):
+    """Emite un nuevo access_token si el refresh_token es válido y no revocado."""
+    digest = hash_refresh_token(request.refresh_token)
+    with db.get_connection() as connection:
+        session = connection.execute('''SELECT s.id, s.user_id, s.expires_at, s.revoked_at
+            FROM auth_session s WHERE s.refresh_token_hash=%s FOR UPDATE''', (digest,)).fetchone()
+        if not session:
+            raise HTTPException(401, 'Refresh token inválido')
+        if session['revoked_at'] is not None:
+            raise HTTPException(401, 'La sesión fue cerrada')
+        if session['expires_at'] < datetime.now(timezone.utc):
+            raise HTTPException(401, 'El refresh token expiró; inicia sesión de nuevo')
+        user = connection.execute('''SELECT * FROM "user" WHERE id=%s AND account_status='active'
+            AND deactivated_at IS NULL''', (session['user_id'],)).fetchone()
+        if not user:
+            raise HTTPException(403, 'La cuenta no está activa')
+        connection.execute('UPDATE auth_session SET last_used_at=NOW() WHERE id=%s', (session['id'],))
+        connection.commit()
+    return RefreshResponse(access_token=create_access_token(str(user['id'])),
+                           expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
 
 def current_user(credentials: HTTPAuthorizationCredentials=Depends(bearer)):
     if not credentials:raise HTTPException(401,'Se requiere un token Bearer')
@@ -152,6 +195,23 @@ def current_user(credentials: HTTPAuthorizationCredentials=Depends(bearer)):
         user=connection.execute('SELECT *, (lower(role)=\'sudo\') AS is_superuser FROM "user" WHERE id=%s AND deactivated_at IS NULL',(user_id,)).fetchone()
     if not user or user['account_status']!='active':raise HTTPException(403,'La cuenta no está activa')
     return user
+
+@app.post('/auth/logout', response_model=MessageResponse)
+def logout(request: LogoutRequest = None, user=Depends(current_user)):
+    """Cierra la sesión. Si viene refresh_token, revoca solo esa; si no, revoca todas."""
+    with db.get_connection() as connection:
+        if request and request.refresh_token:
+            digest = hash_refresh_token(request.refresh_token)
+            result = connection.execute('''UPDATE auth_session SET revoked_at=NOW()
+                WHERE user_id=%s AND refresh_token_hash=%s AND revoked_at IS NULL
+                RETURNING id''', (user['id'], digest))
+            if not result.fetchone():
+                raise HTTPException(404, 'Sesión no encontrada o ya cerrada')
+        else:
+            connection.execute('''UPDATE auth_session SET revoked_at=NOW()
+                WHERE user_id=%s AND revoked_at IS NULL''', (user['id'],))
+        connection.commit()
+    return MessageResponse(message='Sesión cerrada')
 
 @app.get('/auth/me',response_model=UserResponse)
 def me(user=Depends(current_user)):
