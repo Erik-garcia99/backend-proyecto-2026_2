@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg.errors import UniqueViolation
 from . import db
+from .physical_config import create_router as physical_config_router
 from .alerts import create_router as alerts_router, monitor as alerts_monitor
 from .calibrations import CalibrationError, create_router as calibrations_router
 from .gateways import GatewayHub, create_router
@@ -270,4 +271,5 @@ app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(calibrations_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
 app.include_router(pos_router(current_user, db.get_connection))
+app.include_router(physical_config_router(current_user, db.get_connection))
 app.include_router(alerts_router(current_user, db.get_connection))
