@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg.errors import UniqueViolation
 from . import db
+from .alerts import create_router as alerts_router, monitor as alerts_monitor
 from .calibrations import CalibrationError, create_router as calibrations_router
 from .gateways import GatewayHub, create_router
 from .devices import create_router as devices_router, close_discoveries
@@ -31,7 +32,13 @@ async def lifespan(_):
     db.pool.open()
     try:
         await asyncio.to_thread(db.pool.wait, 30)
-        yield
+        stop_alerts = asyncio.Event()
+        alerts_task = asyncio.create_task(alerts_monitor(db.get_connection, stop_alerts))
+        try:
+            yield
+        finally:
+            stop_alerts.set()
+            await alerts_task
     finally:
         await close_discoveries()
         await gateway_hub.close()
@@ -263,3 +270,4 @@ app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(calibrations_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
 app.include_router(pos_router(current_user, db.get_connection))
+app.include_router(alerts_router(current_user, db.get_connection))
