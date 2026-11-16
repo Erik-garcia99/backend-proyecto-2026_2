@@ -53,6 +53,9 @@ class InfluxSettings:
     occupancy_field: str = 'value'
     occupancy_stale_seconds: int = 20
     node_ids: tuple | None = None
+    roi_id: str | None = None
+    roi_config_version: int | None = None
+    roi_calibration_version: int | None = None
 
     @classmethod
     def from_env(cls):
@@ -128,6 +131,27 @@ class HealthResponse(BaseModel):
     status: Literal['ok', 'stale', 'no_data']
 
 
+class RoiOccupancyResponse(BaseModel):
+    branch_id: UUID
+    roi_id: UUID
+    occupancy_pct: int | None
+    config_version: int | None
+    calibration_version: int | None
+    received_at: datetime | None
+    age_seconds: int | None
+    stale_after_seconds: int
+    status: Literal['ok', 'stale', 'no_data']
+    clock_quality: Literal['gateway_received'] = 'gateway_received'
+
+
+def roi_filters(settings):
+    if settings.roi_id is None:
+        return {}
+    return {'roi_id': str(UUID(settings.roi_id)),
+            'config_version': str(int(settings.roi_config_version)),
+            'calibration_version': str(int(settings.roi_calibration_version))}
+
+
 def flux_string(value):
     # JSON quoting plus escaping Flux string interpolation.
     return json.dumps(str(value), ensure_ascii=False).replace('${', r'\${')
@@ -143,7 +167,9 @@ def flux_query(settings, branch_id, measurement=None, field=None):
     q = flux_string
     nodes = ('' if settings.node_ids is None else
              '  |> filter(fn: (r) => contains(value: r["esp_id"], set: ['
-             + ','.join(q(str(UUID(str(n)))) for n in settings.node_ids) + ']))\n')
+              + ','.join(q(str(UUID(str(n)))) for n in settings.node_ids) + ']))\n')
+    nodes += ''.join(f'  |> filter(fn: (r) => r[{q(tag)}] == {q(value)})\n'
+                     for tag, value in roi_filters(settings).items())
     return (f'from(bucket: {q(settings.bucket)})\n'
             f'  |> range(start: -{settings.lookback_hours}h)\n'
             f'  |> filter(fn: (r) => r._measurement == {q(measurement)}'
@@ -161,6 +187,8 @@ def influxql_query(settings, branch_id, measurement=None, field=None, column='te
     if settings.node_ids is not None:
         nodes = 'AND (' + ' OR '.join(
             f'"esp_id" = \'{UUID(str(n))}\'' for n in settings.node_ids) + ') '
+    nodes += ''.join(f'AND {influx_identifier(tag)} = \'{value}\' '
+                     for tag, value in roi_filters(settings).items())
     return (f'SELECT {influx_identifier(field)} AS {influx_identifier(column)} '
             f'FROM {influx_identifier(measurement)} '
             f'WHERE {influx_identifier(settings.branch_tag)} = \'{UUID(str(branch_id))}\' '
@@ -365,7 +393,29 @@ def read_occupancy(settings, branch_id):
                              occupancy=int(point[1]) if point else None,
                              measured_at=measured_at, age_seconds=age,
                              stale_after_seconds=settings.occupancy_stale_seconds,
-                             status=status)
+                              status=status)
+
+
+def read_roi_occupancy(settings, branch_id, roi_id, context):
+    config = context.get('config_version')
+    calibration = context.get('calibration_version')
+    valid = (context.get('calibration_status') == 'calibrated'
+             and config is not None and calibration is not None
+             and context.get('camera_node_id') is not None)
+    point = None
+    if valid:
+        filtered = replace(settings, node_ids=(str(context['camera_node_id']),),
+                           roi_id=str(roi_id), roi_config_version=config,
+                           roi_calibration_version=calibration)
+        point = _fetch_point(filtered, branch_id, 'roi_occ', 'value', 'occupancy')
+    if point is not None and (not point[1].is_integer() or not 0 <= point[1] <= 100):
+        raise HTTPException(502, 'InfluxDB devolvió una ocupación de zona inválida')
+    received_at = point[0] if point else None
+    age, status = _age_and_status(received_at, 60)
+    return RoiOccupancyResponse(
+        branch_id=branch_id, roi_id=roi_id, occupancy_pct=int(point[1]) if point else None,
+        config_version=config, calibration_version=calibration,
+        received_at=received_at, age_seconds=age, stale_after_seconds=60, status=status)
 
 
 def can_read_branch(user, branch):
@@ -435,5 +485,28 @@ def create_router(current_user, get_connection):
         authorized_branch(branch_id, user)
         response.headers['Cache-Control'] = 'no-store'
         return read_health(InfluxSettings.from_env(), str(device_id))
+
+    @router.get('/branches/{branch_id}/rois/{roi_id}/occupancy/latest',
+                response_model=RoiOccupancyResponse)
+    def roi_occupancy(branch_id: UUID, roi_id: UUID, response: Response,
+                      user=Depends(current_user)):
+        authorized_branch(branch_id, user)
+        with get_connection() as connection:
+            context = connection.execute(
+                '''SELECT s.camera_node_id, s.roi_applied_version AS config_version,
+                          c.calibration_version, r.calibration_status
+                   FROM roi r JOIN shelf s ON s.id=r.shelf_id
+                   LEFT JOIN roi_calibration_session c
+                     ON c.id=r.active_calibration_id AND c.state='active'
+                       AND c.config_version=s.roi_applied_version
+                   JOIN esp32_node n ON n.id=s.camera_node_id
+                   JOIN gateway g ON g.id=n.gateway_id AND g.is_active
+                   WHERE r.id=%s AND s.branch_id=%s AND r.is_active
+                     AND n.node_code IS NOT NULL AND n.registration_status='registered' ''',
+                (roi_id, branch_id)).fetchone()
+        if not context:
+            raise HTTPException(404, 'Zona no disponible en esta sucursal')
+        response.headers['Cache-Control'] = 'no-store'
+        return read_roi_occupancy(InfluxSettings.from_env(), branch_id, roi_id, context)
 
     return router
