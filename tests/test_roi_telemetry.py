@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 from uuid import UUID
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from app.telemetry import (InfluxSettings, create_router, flux_query,
@@ -50,17 +50,73 @@ class RoiTelemetryTests(unittest.TestCase):
             self.assertEqual(result.status, 'no_data')
             fetch.assert_not_called()
 
+    def test_cam_moved_filters_by_context_and_is_active_only_until_next_reading(self):
+        settings = replace(SETTINGS, node_ids=(str(NODE),), roi_id=str(ROI),
+                           roi_config_version=28, roi_calibration_version=16)
+        query = flux_query(settings, BRANCH, 'cam_moved', 'value')
+        self.assertIn('cam_moved', query)
+        for tag in ('roi_id', 'config_version', 'calibration_version'):
+            self.assertIn(tag, query)
+
+        moved_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+        older = moved_at - timedelta(seconds=30)
+        newer = moved_at + timedelta(seconds=2)
+
+        def fetch(reading_at):
+            def side_effect(_settings, _branch, measurement, _field, _column):
+                return (reading_at, 55.0) if measurement == 'roi_occ' else (moved_at, 1.0)
+            return side_effect
+
+        with patch('app.telemetry._fetch_point', side_effect=fetch(older)) as f:
+            result = read_roi_occupancy(SETTINGS, BRANCH, ROI, CONTEXT)
+        self.assertTrue(result.cam_moved)
+        self.assertEqual(result.cam_moved_at, moved_at)
+        self.assertEqual(result.occupancy_pct, 55)  # conserva el valor, nunca lo inventa
+        self.assertEqual(f.call_count, 2)
+
+        with patch('app.telemetry._fetch_point', side_effect=fetch(newer)):
+            result = read_roi_occupancy(SETTINGS, BRANCH, ROI, CONTEXT)
+        self.assertFalse(result.cam_moved)
+        self.assertIsNone(result.cam_moved_at)
+
+        def only_moved(_settings, _branch, measurement, _field, _column):
+            return (moved_at, 1.0) if measurement == 'cam_moved' else None
+
+        with patch('app.telemetry._fetch_point', side_effect=only_moved):
+            result = read_roi_occupancy(SETTINGS, BRANCH, ROI, CONTEXT)
+        self.assertTrue(result.cam_moved)
+        self.assertEqual(result.status, 'no_data')
+        self.assertIsNone(result.occupancy_pct)
+
+    def test_cam_moved_query_failure_does_not_break_occupancy(self):
+        reading_at = datetime.now(timezone.utc) - timedelta(seconds=3)
+
+        def side_effect(_settings, _branch, measurement, _field, _column):
+            if measurement == 'roi_occ':
+                return (reading_at, 42.0)
+            raise HTTPException(504, 'timeout')
+
+        with patch('app.telemetry._fetch_point', side_effect=side_effect):
+            result = read_roi_occupancy(SETTINGS, BRANCH, ROI, CONTEXT)
+        self.assertEqual(result.occupancy_pct, 42)
+        self.assertFalse(result.cam_moved)
+        self.assertEqual(result.status, 'ok')
+
     def test_real_flux_transport_filters_roi_and_parses_value(self):
         timestamp = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
         seen = []
         def handle(request):
             seen.append(request.content.decode())
             return httpx.Response(200, text=f',_time,_value\n,{timestamp},100\n')
-        client = httpx.Client(transport=httpx.MockTransport(handle))
-        with patch('app.telemetry.httpx.Client', return_value=client):
+        real_client = httpx.Client  # el patch de app.telemetry.httpx.Client es global al módulo
+        def client_factory(**_kwargs):
+            return real_client(transport=httpx.MockTransport(handle))
+        with patch('app.telemetry.httpx.Client', side_effect=client_factory):
             result = read_roi_occupancy(SETTINGS, BRANCH, ROI, CONTEXT)
         self.assertEqual(result.occupancy_pct, 100)
+        self.assertEqual(len(seen), 2)  # roi_occ y cam_moved
         self.assertIn(str(ROI), seen[0])
+        self.assertIn('cam_moved', seen[1])
 
     def test_authorization_and_endpoint(self):
         row = {**CONTEXT}
