@@ -155,6 +155,38 @@ def create_router(current_user, get_connection):
                     (branch_id, search, f'%{search}%', f'%{search}%', f'%{search}%', limit)).fetchall()
         return [dict(r) for r in rows]
 
+    @router.get('/branches/{branch_id}/inventory/movements')
+    def list_movements(branch_id: UUID, product_id: UUID | None = Query(default=None),
+                       movement_type: str | None = Query(default=None),
+                       date_from: str | None = Query(default=None), date_to: str | None = Query(default=None),
+                       limit: int = Query(default=100, ge=1, le=500), user=Depends(current_user)):
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                branch_org(cursor, user, branch_id)
+                clauses = ['m.branch_id=%s']
+                params = [branch_id]
+                if product_id:
+                    clauses.append('m.product_id=%s'); params.append(product_id)
+                if movement_type:
+                    clauses.append('m.movement_type=%s'); params.append(movement_type)
+                if date_from:
+                    clauses.append('m.occurred_at >= %s'); params.append(date_from)
+                if date_to:
+                    clauses.append('m.occurred_at <= %s'); params.append(date_to)
+                params.append(limit)
+                rows = cursor.execute(
+                    f'''SELECT m.id, m.product_id, p.sku, p.name, m.movement_type,
+                               m.quantity_delta, m.quantity_after, m.reason, m.sale_id,
+                               m.goods_receipt_id, m.occurred_at
+                        FROM inventory_movement m JOIN product p ON p.id=m.product_id
+                        WHERE {' AND '.join(clauses)}
+                        ORDER BY m.occurred_at DESC LIMIT %s''', params).fetchall()
+        return [{
+            **{k: (str(v) if k in {'id', 'product_id', 'sale_id', 'goods_receipt_id'} and v else v)
+               for k, v in dict(r).items()},
+            'occurred_at': _iso(r['occurred_at']),
+        } for r in rows]
+
     @router.get('/branches/{branch_id}/inventory/{product_id}')
     def get_inventory(branch_id: UUID, product_id: UUID, user=Depends(current_user)):
         with get_connection() as conn:
@@ -578,38 +610,6 @@ def create_router(current_user, get_connection):
                 except PosError:
                     conn.rollback()
                     raise
-
-    @router.get('/branches/{branch_id}/inventory/movements')
-    def list_movements(branch_id: UUID, product_id: UUID | None = Query(default=None),
-                       movement_type: str | None = Query(default=None),
-                       date_from: str | None = Query(default=None), date_to: str | None = Query(default=None),
-                       limit: int = Query(default=100, ge=1, le=500), user=Depends(current_user)):
-        with get_connection() as conn:
-            with conn.cursor() as cursor:
-                branch_org(cursor, user, branch_id)
-                clauses = ['m.branch_id=%s']
-                params = [branch_id]
-                if product_id:
-                    clauses.append('m.product_id=%s'); params.append(product_id)
-                if movement_type:
-                    clauses.append('m.movement_type=%s'); params.append(movement_type)
-                if date_from:
-                    clauses.append('m.occurred_at >= %s'); params.append(date_from)
-                if date_to:
-                    clauses.append('m.occurred_at <= %s'); params.append(date_to)
-                params.append(limit)
-                rows = cursor.execute(
-                    f'''SELECT m.id, m.product_id, p.sku, p.name, m.movement_type,
-                               m.quantity_delta, m.quantity_after, m.reason, m.sale_id,
-                               m.goods_receipt_id, m.occurred_at
-                        FROM inventory_movement m JOIN product p ON p.id=m.product_id
-                        WHERE {' AND '.join(clauses)}
-                        ORDER BY m.occurred_at DESC LIMIT %s''', params).fetchall()
-        return [{
-            **{k: (str(v) if k in {'id', 'product_id', 'sale_id', 'goods_receipt_id'} and v else v)
-               for k, v in dict(r).items()},
-            'occurred_at': _iso(r['occurred_at']),
-        } for r in rows]
 
     @router.get('/branches/{branch_id}/products/{product_id}/availability')
     def product_availability(branch_id: UUID, product_id: UUID, user=Depends(current_user)):
