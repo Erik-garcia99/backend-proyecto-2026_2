@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 psycopg[binary,pool]
 bcrypt
+argon2-cffi
 PyJWT
 email-validator
 cryptography>=43,<51
