@@ -636,29 +636,55 @@ def create_router(current_user, get_connection):
                         'updated_at': _iso(inv['updated_at']) if inv else None,
                     }
                 # Estado visual: solo lectura, nunca modifica existencias.
-                rows = cursor.execute(
+                # Fuente real: InfluxDB vía Fase 5 (roi_occ). roi_state queda como legado.
+                roi_rows = cursor.execute(
                     '''SELECT r.id AS roi_id, r.name AS roi_name,
                               s.id AS shelf_id, s.name AS shelf_name, s.location,
-                              rs.occupancy_pct, rs.status, rs.last_reading_at,
-                              rs.last_changed_at, rs.updated_at
+                              s.camera_node_id,
+                              s.roi_applied_version AS config_version,
+                              r.calibration_status,
+                              c.calibration_version
                        FROM roi r
                        JOIN shelf s ON s.id = r.shelf_id
-                       LEFT JOIN roi_state rs ON rs.roi_id = r.id
+                       LEFT JOIN roi_calibration_session c
+                         ON c.id = r.active_calibration_id AND c.state='active'
+                            AND c.config_version = s.roi_applied_version
                        WHERE r.product_id = %s AND s.branch_id = %s AND r.is_active
                        ORDER BY s.name, r.name''',
                     (product_id, branch_id)).fetchall()
-                visual = [{
-                    'roi_id': str(r['roi_id']),
-                    'roi_name': r['roi_name'],
-                    'shelf_id': str(r['shelf_id']),
-                    'shelf_name': r['shelf_name'],
-                    'location': r['location'],
-                    'occupancy_pct': float(r['occupancy_pct']) if r['occupancy_pct'] is not None else None,
-                    'status': r['status'],
-                    'last_reading_at': _iso(r['last_reading_at']),
-                    'last_changed_at': _iso(r['last_changed_at']),
-                    'updated_at': _iso(r['updated_at']),
-                } for r in rows]
+                from .telemetry import read_roi_occupancy, InfluxSettings
+                influx_settings = InfluxSettings.from_env()
+                visual = []
+                for r in roi_rows:
+                    ctx = {
+                        'camera_node_id': str(r['camera_node_id']) if r['camera_node_id'] else None,
+                        'config_version': r['config_version'],
+                        'calibration_version': r['calibration_version'],
+                        'calibration_status': r['calibration_status'],
+                    }
+                    occ = None
+                    status = 'no_data'
+                    received_at = None
+                    try:
+                        res = read_roi_occupancy(influx_settings, branch_id, r['roi_id'], ctx)
+                        occ = res.occupancy_pct
+                        status = res.status
+                        received_at = res.received_at
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning('availability: lectura visual falló para roi %s: %s', r['roi_id'], exc)
+                        status = 'error'
+                    visual.append({
+                        'roi_id': str(r['roi_id']),
+                        'roi_name': r['roi_name'],
+                        'shelf_id': str(r['shelf_id']),
+                        'shelf_name': r['shelf_name'],
+                        'location': r['location'],
+                        'occupancy_pct': occ,
+                        'status': status,
+                        'last_reading_at': received_at.isoformat() if received_at is not None else None,
+                        'last_changed_at': None,
+                        'updated_at': None,
+                    })
                 return {
                     'product_id': str(product['id']),
                     'sku': product['sku'],
