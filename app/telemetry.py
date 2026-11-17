@@ -142,6 +142,8 @@ class RoiOccupancyResponse(BaseModel):
     stale_after_seconds: int
     status: Literal['ok', 'stale', 'no_data']
     clock_quality: Literal['gateway_received'] = 'gateway_received'
+    cam_moved: bool = False
+    cam_moved_at: datetime | None = None
 
 
 def roi_filters(settings):
@@ -403,19 +405,35 @@ def read_roi_occupancy(settings, branch_id, roi_id, context):
              and config is not None and calibration is not None
              and context.get('camera_node_id') is not None)
     point = None
+    moved = None
     if valid:
         filtered = replace(settings, node_ids=(str(context['camera_node_id']),),
                            roi_id=str(roi_id), roi_config_version=config,
                            roi_calibration_version=calibration)
         point = _fetch_point(filtered, branch_id, 'roi_occ', 'value', 'occupancy')
+        try:
+            # Serie opcional: nodos sin Fase 6 no la publican. Un fallo aquí no
+            # debe romper la lectura de ocupación que ya se obtuvo.
+            moved = _fetch_point(filtered, branch_id, 'cam_moved', 'value', 'cam_moved_at')
+        except HTTPException as exc:
+            log.warning('No se pudo consultar cam_moved del ROI %s: %s', roi_id, exc.detail)
     if point is not None and (not point[1].is_integer() or not 0 <= point[1] <= 100):
         raise HTTPException(502, 'InfluxDB devolvió una ocupación de zona inválida')
     received_at = point[0] if point else None
     age, status = _age_and_status(received_at, 60)
+    cam_moved = False
+    cam_moved_at = None
+    if moved is not None and moved[1].is_integer() and moved[1] == 1:
+        # El aviso solo sigue vigente si no llegó una medición después: el nodo
+        # reanuda roi_occ tras la recuperación, sin un evento de "fin".
+        if received_at is None or moved[0] > received_at:
+            cam_moved = True
+            cam_moved_at = moved[0]
     return RoiOccupancyResponse(
         branch_id=branch_id, roi_id=roi_id, occupancy_pct=int(point[1]) if point else None,
         config_version=config, calibration_version=calibration,
-        received_at=received_at, age_seconds=age, stale_after_seconds=60, status=status)
+        received_at=received_at, age_seconds=age, stale_after_seconds=60, status=status,
+        cam_moved=cam_moved, cam_moved_at=cam_moved_at)
 
 
 def can_read_branch(user, branch):
