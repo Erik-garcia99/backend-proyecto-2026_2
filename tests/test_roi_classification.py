@@ -95,7 +95,7 @@ class FakeConnection:
             result.fetchone.return_value = {'id': B, 'organization_id': O}
         elif 'FROM roi r' in sql and 'LEFT JOIN roi_state' in sql:
             result.fetchall.return_value = [{**self.roi, **self.stored,
-                                             'last_reading_at': NOW}]
+                                             'last_reading_at': self.stored.get('last_reading_at')}]
         elif 'FROM roi r' in sql:
             result.fetchone.return_value = self.roi
         elif 'SELECT * FROM roi_state WHERE roi_id' in sql:
@@ -155,6 +155,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(body['quality'], 'stale')
         self.assertEqual(body['cam_moved'], False)
 
+    def test_no_data_does_not_insert_null_into_roi_reading(self):
+        self.serve[0] = occupancy(None, status='no_data')
+        body = self.client.get(self.state_path).json()
+        self.assertEqual(body['quality'], 'no_data')
+        self.assertEqual(body['occupancy_pct'], None)
+        self.assertFalse(any('INSERT INTO roi_reading' in sql for sql, _ in self.conn.calls))
+
     def test_cam_moved_reports_camera_moved_without_changing_status(self):
         self.serve[0] = occupancy(90, cam_moved=True)
         body = self.client.get(self.state_path).json()
@@ -171,12 +178,24 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(body['quality'], 'not_calibrated')
 
     def test_shelf_states_reads_persisted_state_without_influx(self):
-        self.serve[0] = None  # el listado nunca llama al lector
+        self.conn.stored['last_reading_at'] = NOW  # lectura fresca: no reclasifica
+        self.serve[0] = None  # el listado no llama al lector
         response = self.client.get(self.list_path)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.json()[0]['status'], 'adequate')
         self.assertEqual(response.json()[0]['shelf_name'], 'Estante')
+
+    def test_shelf_states_classifies_when_no_persisted_reading(self):
+        self.conn.stored['last_reading_at'] = None
+        self.serve[0] = occupancy(2)
+        response = self.client.get(self.list_path)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()[0]
+        self.assertEqual(body['status'], 'empty')
+        self.assertEqual(body['quality'], 'ok')
+        self.assertEqual(body['occupancy_pct'], 2)
+        self.assertTrue(any('INSERT INTO roi_state' in sql for sql, _ in self.conn.calls))
 
     def test_forbidden_user_is_403(self):
         self.user = {**self.user, 'role': 'employee', 'organization_id': UUID(int=9)}

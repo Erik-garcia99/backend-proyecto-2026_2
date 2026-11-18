@@ -7,6 +7,7 @@ Una lectura sin frescura, con ``cam_moved`` o sin calibración vigente **no**
 cambia el estado: se expone la calidad y se conserva el último estado válido.
 La ocupación visual nunca modifica inventario lógico (F-21, C-17).
 """
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Literal
@@ -17,6 +18,8 @@ from pydantic import BaseModel
 
 from .devices import iso, require_branch
 from .telemetry import InfluxSettings, RoiOccupancyResponse, read_roi_occupancy
+
+log = logging.getLogger(__name__)
 
 STATUS_RANK = {'empty': 0, 'low': 1, 'medium': 2, 'adequate': 3}
 LABELS = {'unknown': 'Desconocido', 'empty': 'Agotado', 'low': 'Bajo',
@@ -194,18 +197,21 @@ def classify(connection, row: dict, occupancy: RoiOccupancyResponse, thresholds:
 
     if not usable:
         # No se transforma ausencia, antigüedad ni cámara movida en un estado.
-        connection.execute(
-            'INSERT INTO roi_reading(roi_id,occupancy_pct,candidate_status,is_discarded) '
-            'VALUES(%s,%s,NULL,TRUE)',
-            (roi_id, occupancy.occupancy_pct))
+        # occupancy_pct es NOT NULL en roi_reading: sin valor no se inserta fila.
+        if occupancy.occupancy_pct is not None:
+            connection.execute(
+                'INSERT INTO roi_reading(roi_id,occupancy_pct,candidate_status,is_discarded) '
+                'VALUES(%s,%s,NULL,TRUE)',
+                (roi_id, occupancy.occupancy_pct))
         status = 'unknown' if not calibrated else state.get('status') or 'unknown'
         connection.execute(
             'INSERT INTO roi_state(roi_id,occupancy_pct,status,pending_status,pending_samples,'
             'last_reading_at,updated_at) VALUES(%s,NULL,%s,NULL,0,NULL,NOW()) '
             'ON CONFLICT(roi_id) DO UPDATE SET status=EXCLUDED.status,updated_at=NOW()',
             (roi_id, status))
-        return {**state, 'status': status, 'occupancy_pct': None, 'pending_status': None,
-                'pending_samples': 0, 'confidence': None}
+        # El último valor conocido se conserva: solo la calidad cambia.
+        return {**state, 'status': status, 'occupancy_pct': state.get('occupancy_pct'),
+                'pending_status': None, 'pending_samples': 0, 'confidence': state.get('confidence')}
 
     pct = int(occupancy.occupancy_pct)
     result = classify_step(pct, thresholds, state, last_pct=last_pct,
@@ -297,8 +303,8 @@ STATE_ROWS_SQL = '''
     FROM roi r
     JOIN shelf s ON s.id=r.shelf_id
     JOIN product p ON p.id=r.product_id
-    JOIN esp32_node n ON n.id=s.camera_node_id
-    JOIN gateway g ON g.id=n.gateway_id AND g.is_active
+    LEFT JOIN esp32_node n ON n.id=s.camera_node_id
+    LEFT JOIN gateway g ON g.id=n.gateway_id AND g.is_active
     LEFT JOIN roi_calibration_session c ON c.id=r.active_calibration_id
          AND c.state='active' AND c.config_version=s.roi_applied_version
     LEFT JOIN roi_state st ON st.roi_id=r.id
@@ -340,25 +346,44 @@ def create_router(current_user, get_connection, reader: RoiReader | None = None)
 
     @router.get('/branches/{branch_id}/shelf-states', response_model=list[RoiStateResponse])
     def shelf_states(branch_id: UUID, response: Response, user=Depends(current_user)):
+        result = []
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
             rows = connection.execute(STATE_ROWS_SQL, (branch_id,)).fetchall()
+            for row in rows:
+                last = row.get('last_reading_at')
+                age = max(0, int((datetime.now(timezone.utc) - last).total_seconds())) if last else None
+                fresh = last is not None and age < STALE_SECONDS
+                occupancy = None
+                # Si no hay estado persistido o está vencido, clasificar al leer.
+                # Así la pantalla muestra datos aunque el monitor aún no corrió.
+                if (not fresh and row.get('camera_node_id')
+                        and row.get('calibration_status') == 'calibrated'
+                        and row.get('config_version') is not None):
+                    try:
+                        context = {**_reader_context(row), 'branch_id': str(branch_id),
+                                   'roi_id': str(row['roi_id'])}
+                        occupancy = read(context)
+                        state = classify(connection, row, occupancy, thresholds_from(row))
+                        row = {**row, **state}
+                    except Exception:
+                        log.exception('No se pudo clasificar la ROI %s al listar estados',
+                                      row['roi_id'])
+                        occupancy = None
+                if occupancy is None:
+                    quality: Quality = ('no_data' if last is None else
+                                        'stale' if age >= STALE_SECONDS else 'ok')
+                    if row['calibration_status'] != 'calibrated':
+                        quality = 'not_calibrated'
+                    occupancy = RoiOccupancyResponse(
+                        branch_id=branch_id, roi_id=row['roi_id'], occupancy_pct=None,
+                        config_version=row.get('config_version'),
+                        calibration_version=row.get('calibration_version'),
+                        received_at=last, age_seconds=age, stale_after_seconds=STALE_SECONDS,
+                        status=quality if quality in ('ok', 'stale', 'no_data') else 'no_data')
+                result.append(_response(branch_id, row, row, occupancy, thresholds_from(row)))
+            connection.commit()
         response.headers['Cache-Control'] = 'no-store'
-        result = []
-        for row in rows:
-            last = row.get('last_reading_at')
-            age = max(0, int((datetime.now(timezone.utc) - last).total_seconds())) if last else None
-            quality: Quality = ('no_data' if last is None else
-                                'stale' if age >= STALE_SECONDS else 'ok')
-            if row['calibration_status'] != 'calibrated':
-                quality = 'not_calibrated'
-            fake = RoiOccupancyResponse(
-                branch_id=branch_id, roi_id=row['roi_id'], occupancy_pct=None,
-                config_version=row.get('config_version'),
-                calibration_version=row.get('calibration_version'),
-                received_at=last, age_seconds=age, stale_after_seconds=STALE_SECONDS,
-                status=quality if quality in ('ok', 'stale', 'no_data') else 'no_data')
-            result.append(_response(branch_id, row, row, fake, thresholds_from(row)))
         return result
 
     return router
