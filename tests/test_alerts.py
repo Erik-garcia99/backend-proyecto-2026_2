@@ -54,7 +54,9 @@ class AlertsApiTest(unittest.TestCase):
         self.assertEqual(response.headers['cache-control'], 'no-store')
         data = response.json()
         self.assertEqual(data['items'], [])
-        self.assertEqual(data['sources']['stock_empty'], 'not_connected')
+        self.assertEqual(data['sources']['stock_empty'], 'roi_state_monitor')
+        self.assertEqual(data['sources']['stock_low'], 'roi_state_monitor')
+        self.assertEqual(data['sources']['environment'], 'not_connected')
         self.assertIn('monitor', data)
 
     def test_customer_denied_even_with_legacy_branch(self):

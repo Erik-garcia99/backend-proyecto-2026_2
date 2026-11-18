@@ -288,13 +288,17 @@ STATE_ROWS_SQL = '''
     SELECT r.id AS roi_id, r.product_id, r.name AS roi_name, p.sku,
            r.threshold_empty_pct, r.threshold_low_pct, r.threshold_medium_pct,
            r.confirm_samples, r.physical_config_version, r.calibration_status,
-           s.id AS shelf_id, s.name AS shelf_name, s.roi_applied_version AS config_version,
-           c.calibration_version, st.status, st.occupancy_pct, st.confidence,
+           s.id AS shelf_id, s.name AS shelf_name, s.branch_id,
+           s.roi_applied_version AS config_version,
+           n.id AS node_id, g.id AS gateway_id, c.calibration_version,
+           st.status, st.occupancy_pct, st.confidence,
            st.pending_status, st.pending_samples, st.last_reading_at,
            st.last_changed_at, st.updated_at
     FROM roi r
     JOIN shelf s ON s.id=r.shelf_id
     JOIN product p ON p.id=r.product_id
+    JOIN esp32_node n ON n.id=s.camera_node_id
+    JOIN gateway g ON g.id=n.gateway_id AND g.is_active
     LEFT JOIN roi_calibration_session c ON c.id=r.active_calibration_id
          AND c.state='active' AND c.config_version=s.roi_applied_version
     LEFT JOIN roi_state st ON st.roi_id=r.id

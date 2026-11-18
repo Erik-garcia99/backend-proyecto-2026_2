@@ -188,7 +188,10 @@ def create_router(current_user, get_connection):
                 'monitor': dict(monitor_health),
                 'sources': {
                     'node_offline': 'signed_heartbeat_monitor',
-                    **{name: 'not_connected' for name in TYPES if name != 'node_offline'}}}
+                    'stock_low': 'roi_state_monitor',
+                    'stock_empty': 'roi_state_monitor',
+                    **{name: 'not_connected' for name in TYPES
+                       if name not in ('node_offline', 'stock_low', 'stock_empty')}}}
 
     @router.get('/branches/{branch_id}/alerts/{alert_id}')
     def detail(branch_id: UUID, alert_id: UUID, response: Response, user=Depends(current_user)):
