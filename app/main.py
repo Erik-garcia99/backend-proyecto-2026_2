@@ -367,6 +367,7 @@ app.include_router(guide_gateway_router(db.get_connection))
 app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(calibrations_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
+app.include_router(pos_router(current_user, db.get_connection))
 
 @app.get('/customer/home', response_model=CustomerHomeResponse)
 def customer_home(branch_id: UUID, user=Depends(current_user)):
