@@ -31,6 +31,22 @@ class CustomerRegisterRequest(BaseModel):
     organization_slug: str | None = Field(default=None, max_length=100)
 
 
+class CustomerBranchItem(BaseModel):
+    id: str
+    name: str
+    address: str | None = None
+    business_category: str | None = None
+    max_capacity_people: int | None = None
+
+
+class CustomerBranchesResponse(BaseModel):
+    items: list[CustomerBranchItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
 class CustomerHomeResponse(BaseModel):
     branch_id: str
     branch_name: str
@@ -40,6 +56,8 @@ class CustomerHomeResponse(BaseModel):
     stale_after_seconds: int
     status: str
     has_catalog: bool = True
+    occupancy_level: str | None = None
+    max_capacity_people: int | None = None
 
 
 class LoginRequest(BaseModel):

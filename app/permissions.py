@@ -67,7 +67,7 @@ def require_branch_actor(connection, branch_id, user, *, admin=False, staff=Fals
                     ((ADMIN, admin), (STAFF, staff), (CUSTOMER, customer)) if flag)
     require_actor(user, *allowed)
     branch = connection.execute(
-        '''SELECT b.id, b.organization_id FROM branch b
+        '''SELECT b.id, b.organization_id, b.name, b.address, b.max_capacity_people, b.occupancy_near_pct FROM branch b
            JOIN organization o ON o.id=b.organization_id
            WHERE b.id=%s AND b.is_active AND o.is_active''',
         (branch_id,)).fetchone()

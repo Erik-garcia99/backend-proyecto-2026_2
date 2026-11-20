@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 import jwt
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -22,8 +22,9 @@ from .pos import PosError, create_router as pos_router, error_response as pos_er
 from .node_registration import make_router as node_router
 from .telemetry import (create_router as telemetry_router, read_occupancy, InfluxSettings, replace)
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
-from .permissions import require_branch_actor, CUSTOMER
-from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerHomeResponse, CustomerRegisterRequest, LoginRequest,
+from .permissions import require_actor, require_branch_actor, CUSTOMER
+from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerBranchItem, CustomerBranchesResponse,
+                      CustomerHomeResponse, CustomerRegisterRequest, LoginRequest,
                       LoginResponse, LogoutRequest, MessageResponse, NotificationPreferences,
                       NotificationPreferencesUpdate, PasswordChangeRequest, PendingUserResponse,
                       ProfileUpdateRequest, RefreshRequest, RefreshResponse,
@@ -376,6 +377,90 @@ app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(calibrations_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
 
+def classify_occupancy(occupancy: int | None, status: str, max_capacity: int | None, near_pct: float = 80.0) -> str:
+    if occupancy is None or status != 'ok':
+        return 'no_data'
+    if max_capacity and max_capacity > 0:
+        ratio = (occupancy / max_capacity) * 100.0
+        if occupancy >= max_capacity or ratio >= 100.0:
+            return 'full'
+        if ratio >= near_pct:
+            return 'near'
+        return 'available'
+    if occupancy >= 100:
+        return 'full'
+    if occupancy >= near_pct:
+        return 'near'
+    return 'available'
+
+
+@app.get('/customer/branches', response_model=CustomerBranchesResponse)
+def customer_branches(page: int = Query(1, ge=1),
+                      page_size: int = Query(5, ge=1, le=5),
+                      q: str | None = Query(None, max_length=100),
+                      user=Depends(current_user)):
+    require_actor(user, CUSTOMER)
+    org_id = user.get('organization_id')
+    if not org_id:
+        raise HTTPException(403, 'No tienes una organización asignada')
+
+    with db.get_connection() as connection:
+        org = connection.execute(
+            'SELECT id FROM organization WHERE id=%s AND is_active=TRUE',
+            (org_id,)).fetchone()
+        if not org:
+            raise HTTPException(403, 'Organización inactiva o no encontrada')
+
+        params = [org_id]
+        where_clauses = ['b.organization_id = %s', 'b.is_active = TRUE']
+
+        if q and q.strip():
+            where_clauses.append('(b.name ILIKE %s OR b.address ILIKE %s)')
+            term = f'%{q.strip()}%'
+            params.extend([term, term])
+
+        where_sql = ' AND '.join(where_clauses)
+
+        total_row = connection.execute(
+            f'SELECT COUNT(*) as total FROM branch b WHERE {where_sql}',
+            tuple(params)
+        ).fetchone()
+        total = int(total_row['total']) if total_row else 0
+
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+        offset = (page - 1) * page_size
+
+        query_params = list(params)
+        query_params.extend([page_size, offset])
+
+        rows = connection.execute(
+            f'''SELECT b.id, b.name, b.address, b.business_category, b.max_capacity_people
+                FROM branch b
+                WHERE {where_sql}
+                ORDER BY b.name ASC
+                LIMIT %s OFFSET %s''',
+            tuple(query_params)
+        ).fetchall()
+
+    items = [
+        CustomerBranchItem(
+            id=str(r['id']),
+            name=r['name'],
+            address=r.get('address'),
+            business_category=r.get('business_category'),
+            max_capacity_people=r.get('max_capacity_people'),
+        )
+        for r in rows
+    ]
+    return CustomerBranchesResponse(
+        items=items,
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages
+    )
+
+
 @app.get('/customer/home', response_model=CustomerHomeResponse)
 def customer_home(branch_id: UUID, user=Depends(current_user)):
     with db.get_connection() as connection:
@@ -386,9 +471,13 @@ def customer_home(branch_id: UUID, user=Depends(current_user)):
                   AND n.registration_status='registered' ''', (branch_id,)).fetchall()
     settings = replace(InfluxSettings.from_env(), node_ids=tuple(str(n['id']) for n in nodes))
     occupancy = read_occupancy(settings, branch_id)
-    return CustomerHomeResponse(branch_id=str(branch['id']), branch_name=branch['name'],
+    near_pct = float(branch.get('occupancy_near_pct') or 80.0)
+    max_cap = branch.get('max_capacity_people')
+    level = classify_occupancy(occupancy.occupancy, occupancy.status, max_cap, near_pct)
+    return CustomerHomeResponse(branch_id=str(branch['id']), branch_name=branch.get('name') or 'Sucursal',
                                occupancy=occupancy.occupancy, measured_at=occupancy.measured_at,
                                age_seconds=occupancy.age_seconds,
                                stale_after_seconds=occupancy.stale_after_seconds,
-                               status=occupancy.status, has_catalog=True)
+                               status=occupancy.status, has_catalog=True,
+                               occupancy_level=level, max_capacity_people=max_cap)
 app.include_router(alerts_router(current_user, db.get_connection))
