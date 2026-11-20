@@ -19,6 +19,29 @@ class RegisterRequest(BaseModel):
     registration_token: str = Field(min_length=1, max_length=255)
 
 
+class CustomerRegisterRequest(BaseModel):
+    """Alta de cliente final. `role` no se acepta: si llega, Pydantic responde 422."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+
+    email: str = Field(min_length=3, max_length=320, pattern=EMAIL_PATTERN)
+    password: str = Field(min_length=8, max_length=128)
+    first_name: str = Field(min_length=1, max_length=100)
+    last_name: str = Field(min_length=1, max_length=100)
+    phone: str | None = Field(default=None, max_length=30)
+    organization_slug: str | None = Field(default=None, max_length=100)
+
+
+class CustomerHomeResponse(BaseModel):
+    branch_id: str
+    branch_name: str
+    occupancy: int | None
+    measured_at: datetime | None
+    age_seconds: int | None
+    stale_after_seconds: int
+    status: str
+    has_catalog: bool = True
+
+
 class LoginRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320, pattern=EMAIL_PATTERN)
     password: str
@@ -74,8 +97,24 @@ class NotificationPreferencesUpdate(BaseModel):
 
 class LoginResponse(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
+    expires_in: int
     user: UserResponse
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str = Field(min_length=1, max_length=255)
+
+
+class RefreshResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str | None = Field(default=None, max_length=255)
 
 
 class RegisterResponse(BaseModel):
