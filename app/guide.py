@@ -44,6 +44,7 @@ class GuideAssociationCreate(BaseModel):
     model_config = ConfigDict(extra='forbid')
     product_id: UUID
     guide_point_id: UUID
+    replace_product_id: UUID | None = None
 
 
 class GuideCapabilities(BaseModel):
@@ -133,7 +134,8 @@ def _resolve(connection, branch_id, product_id, organization_id):
              JOIN esp32_node n ON n.id=gp.node_id AND n.node_type='guide'
                   AND n.registration_status='registered'
              JOIN gateway g ON g.id=n.gateway_id AND g.is_active AND g.branch_id=%s
-            WHERE lpl.branch_id=%s AND lpl.product_id=%s AND p.organization_id=%s''',
+            WHERE lpl.branch_id=%s AND lpl.product_id=%s AND p.organization_id=%s
+            FOR UPDATE OF gp, lpl''',
         (branch_id, branch_id, product_id, organization_id)).fetchall()
     if not rows:
         raise HTTPException(404, 'guide_association_missing')
@@ -363,7 +365,7 @@ def create_router(current_user, get_connection, hub):
                      JOIN esp32_node n ON n.id=gp.node_id AND n.node_type='guide'
                      JOIN gateway g ON g.id=n.gateway_id AND g.is_active AND g.branch_id=%s
                      LEFT JOIN shelf s ON s.id=gp.shelf_id
-                    WHERE gp.id=%s''', (branch_id, body.guide_point_id)).fetchone()
+                    WHERE gp.id=%s FOR UPDATE OF gp''', (branch_id, body.guide_point_id)).fetchone()
             if not point:
                 raise HTTPException(404, 'Luz de guía no encontrada en esta sucursal')
             product = connection.execute(
@@ -383,7 +385,26 @@ def create_router(current_user, get_connection, hub):
                     _no_store(response)
                     return body_out
                 raise HTTPException(409, 'El producto ya está asociado a otra luz de la guía')
+            occupants = connection.execute(
+                '''SELECT product_id FROM guide_product_light
+                    WHERE branch_id=%s AND guide_point_id=%s''',
+                (branch_id, body.guide_point_id)).fetchall()
+            expected = [body.replace_product_id] if body.replace_product_id else []
+            if [row['product_id'] for row in occupants] != expected:
+                raise HTTPException(409, 'La asociación de esta luz cambió o está ocupada; actualiza la lista')
+            active = connection.execute(
+                '''SELECT 1 FROM led_guide_request
+                    WHERE branch_id=%s AND guide_point_id=%s
+                      AND (status IN ('pending','active') OR closing) LIMIT 1''',
+                (branch_id, body.guide_point_id)).fetchone()
+            if active:
+                raise HTTPException(409, 'La luz tiene una guía activa; ciérrala antes de cambiar el producto')
             try:
+                if body.replace_product_id:
+                    connection.execute(
+                        '''DELETE FROM guide_product_light
+                            WHERE branch_id=%s AND guide_point_id=%s AND product_id=%s''',
+                        (branch_id, body.guide_point_id, body.replace_product_id))
                 connection.execute(
                     '''INSERT INTO guide_product_light
                            (branch_id, product_id, guide_point_id, created_by)
@@ -400,6 +421,11 @@ def create_router(current_user, get_connection, hub):
     def unassign_product(branch_id: UUID, product_id: UUID, user=Depends(current_user)):
         with _connection() as connection:
             require_branch_actor(connection, branch_id, user, admin=True)
+            connection.execute(
+                '''SELECT gp.id FROM led_guide_point gp
+                    JOIN guide_product_light lpl ON lpl.guide_point_id=gp.id
+                    WHERE lpl.branch_id=%s AND lpl.product_id=%s FOR UPDATE OF gp''',
+                (branch_id, product_id)).fetchone()
             active = connection.execute(
                 '''SELECT 1 FROM led_guide_request
                     WHERE branch_id=%s AND product_id=%s

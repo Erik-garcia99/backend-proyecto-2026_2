@@ -27,7 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .registration_tokens import require_branch_access
 from .permissions import require_branch_actor
 
-LIGHT_LIMIT = 10
+LIGHT_LIMIT = 8
 DISCOVERY_TIMEOUT_SECONDS = 120
 DISCOVERY_SETTLE_SECONDS = 3
 
@@ -617,7 +617,9 @@ def create_router(current_user, get_connection, hub):
                   response: Response, user=Depends(current_user)):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
-            load_node(connection, branch_id, device_id, node_type='guide', lock=True)
+            node = load_node(connection, branch_id, device_id, node_type='guide', lock=True)
+            if body.channel >= int(node.get('guide_channels') or LIGHT_LIMIT):
+                raise HTTPException(422, 'El canal no existe en este nodo')
             shelf = shelf_in_branch(connection, branch_id, body.shelf_id)
             existing = connection.execute(
                 'SELECT * FROM led_guide_point WHERE node_id=%s AND led_index=%s',

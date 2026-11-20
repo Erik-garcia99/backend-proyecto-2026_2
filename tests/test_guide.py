@@ -51,6 +51,9 @@ class FakeConnection:
         self.existing = existing or {}
         self.gateway_row = None
         self.node_row = None
+        self.occupants = []
+        self.association = None
+        self.active_light = False
 
     def execute(self, sql, params=None):
         params = params or ()
@@ -80,7 +83,11 @@ class FakeConnection:
                 'rpi_identifier': RPI, 'shelf_name': 'Estante 3',
                 'location_label': 'Pasillo central', 'guide_channels': self.channels})
         if 'FROM guide_product_light' in sql and 'WHERE branch_id=%s AND product_id=%s' in sql:
-            return FakeCursor(None)
+            return FakeCursor(self.association)
+        if 'SELECT product_id FROM guide_product_light' in sql:
+            return FakeCursor(rows=[{'product_id': value} for value in self.occupants])
+        if 'SELECT 1 FROM led_guide_request' in sql and 'guide_point_id=%s' in sql:
+            return FakeCursor({'exists': 1} if self.active_light else None)
         if 'FROM led_guide_point gp' in sql:
             return FakeCursor({'id': POINT, 'shelf_name': 'Estante 3'})
         if 'FROM product' in sql and 'is_active' in sql:
@@ -284,6 +291,53 @@ class GuideApiTests(unittest.TestCase):
                                      headers={'Idempotency-Key': 'idempotencia-123456'},
                                      json={'product_id': str(PRODUCT),
                                            'channel': 2}).status_code, 422)
+
+    def _assign(self, **extra):
+        client = self.use(user('owner', OWNER))
+        return client.post(f'/branches/{BRANCH}/guide-associations',
+                           json={'product_id': str(PRODUCT),
+                                 'guide_point_id': str(POINT), **extra})
+
+    def test_occupied_led_requires_explicit_replacement(self):
+        self.connection.occupants = [OWNER]
+        self.assertEqual(self._assign().status_code, 409)
+        self.assertFalse(any('INSERT INTO guide_product_light' in sql
+                             for sql, _ in self.connection.calls))
+
+    def test_replacement_deletes_only_expected_product_before_insert(self):
+        self.connection.occupants = [OWNER]
+        response = self._assign(replace_product_id=str(OWNER))
+        self.assertEqual(response.status_code, 201, response.text)
+        writes = [(sql, params) for sql, params in self.connection.calls
+                  if 'DELETE FROM guide_product_light' in sql or
+                  'INSERT INTO guide_product_light' in sql]
+        self.assertEqual(len(writes), 2)
+        self.assertIn('DELETE', writes[0][0])
+        self.assertEqual(writes[0][1], (BRANCH, POINT, OWNER))
+        self.assertIn('INSERT', writes[1][0])
+
+    def test_stale_replacement_does_not_delete_anything(self):
+        self.connection.occupants = [CUSTOMER]
+        self.assertEqual(self._assign(replace_product_id=str(OWNER)).status_code, 409)
+        self.assertFalse(any('DELETE FROM guide_product_light' in sql
+                             for sql, _ in self.connection.calls))
+
+    def test_active_led_cannot_be_replaced(self):
+        self.connection.occupants = [OWNER]
+        self.connection.active_light = True
+        self.assertEqual(self._assign(replace_product_id=str(OWNER)).status_code, 409)
+        self.assertFalse(any('DELETE FROM guide_product_light' in sql
+                             for sql, _ in self.connection.calls))
+
+    def test_product_on_another_led_is_not_silently_moved(self):
+        self.connection.association = {'guide_point_id': NODE}
+        self.assertEqual(self._assign().status_code, 409)
+
+    def test_same_association_is_idempotent(self):
+        self.connection.association = {'guide_point_id': POINT}
+        self.assertEqual(self._assign().status_code, 201)
+        self.assertFalse(any('INSERT INTO guide_product_light' in sql
+                             for sql, _ in self.connection.calls))
 
 
 class CapabilitiesTests(unittest.TestCase):
