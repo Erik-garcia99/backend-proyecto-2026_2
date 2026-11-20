@@ -1,42 +1,43 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import secrets
 from .security_tokens import token_hash
 
 import bcrypt
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, InvalidHashError
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 
-from .config import JWT_ALGORITHM, JWT_SECRET
+from .config import JWT_ALGORITHM, JWT_SECRET, ACCESS_TOKEN_EXPIRE_MINUTES
 
-_argon2 = PasswordHasher()
-_BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
+_ph = PasswordHasher()
 
 
 def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+    """Hash con Argon2id (D-C15)."""
+    return _ph.hash(password)
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    """Verifica contraseñas hasheadas con bcrypt o argon2id.
-
-    Los usuarios sembrados a mano tienen hashes argon2id, mientras que los
-    creados por la API usan bcrypt. Se aceptan ambos formatos para no dejar
-    cuentas fuera por el algoritmo con el que se generó su hash.
-    """
-    if not password_hash:
+    """Verifica contra Argon2id o bcrypt. Devuelve True/False."""
+    if password_hash.startswith('$argon2'):
+        try:
+            return _ph.verify(password_hash, password)
+        except (VerifyMismatchError, InvalidHashError):
+            return False
+    # Fallback: bcrypt (hashes anteriores a D-C15).
+    try:
+        return bcrypt.checkpw(password.encode(), password_hash.encode())
+    except (ValueError, TypeError):
         return False
-    if password_hash.startswith(_BCRYPT_PREFIXES):
-        try:
-            return bcrypt.checkpw(password.encode(), password_hash.encode())
-        except (ValueError, TypeError):
-            return False
-    if password_hash.startswith("$argon2"):
-        try:
-            return _argon2.verify(password_hash, password)
-        except (VerificationError, InvalidHashError):
-            return False
-    return False
+
+
+def needs_rehash(password_hash: str) -> bool:
+    """True si el hash es bcrypt o Argon2id con parámetros viejos."""
+    if not password_hash.startswith('$argon2'):
+        return True
+    return _ph.check_needs_rehash(password_hash)
 
 
 def hash_registration_token(token: str) -> str:
@@ -47,11 +48,20 @@ def generate_registration_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def generate_refresh_token() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def hash_refresh_token(token: str) -> str:
+    return token_hash(token)
+
+
 def create_access_token(user_id: str) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "iat": now,
+        "exp": now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 

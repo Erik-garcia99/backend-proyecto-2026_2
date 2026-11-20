@@ -25,8 +25,9 @@ from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field
 
 from .registration_tokens import require_branch_access
+from .permissions import require_branch_actor
 
-LIGHT_LIMIT = 10
+LIGHT_LIMIT = 8
 DISCOVERY_TIMEOUT_SECONDS = 120
 DISCOVERY_SETTLE_SECONDS = 3
 
@@ -439,12 +440,14 @@ def create_router(current_user, get_connection, hub):
     def light_channels(branch_id: UUID, device_id: UUID, response: Response, user=Depends(current_user)):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
-            load_node(connection, branch_id, device_id, node_type='guide')
+            node = load_node(connection, branch_id, device_id, node_type='guide')
             used = {row['led_index'] for row in connection.execute(
                 'SELECT led_index FROM led_guide_point WHERE node_id=%s', (device_id,)).fetchall()}
+        capacity = node.get('guide_channels')
+        available_range = range(int(capacity)) if capacity else range(0)
         response.headers['Cache-Control'] = 'no-store'
         return [{'id': channel, 'label': f'Luz {channel + 1}', 'available': channel not in used}
-                for channel in range(LIGHT_LIMIT)]
+                for channel in available_range]
 
     @router.get('/branches/{branch_id}/shelves')
     def list_shelves(branch_id: UUID, response: Response, user=Depends(current_user)):
@@ -467,6 +470,25 @@ def create_router(current_user, get_connection, hub):
         return shelf
 
     # --- Fase 3: catálogo mínimo de productos y vínculo cámara-repisa ---
+
+    @router.get('/branches/{branch_id}/shelves/{shelf_id}/products')
+    def list_shelf_products(branch_id: UUID, shelf_id: UUID, response: Response,
+                            user=Depends(current_user)):
+        with get_connection() as connection:
+            branch = require_branch(connection, branch_id, user)
+            shelf_in_branch(connection, branch_id, shelf_id)
+            # Ubicación propia de la guía. Una zona de cámara no asigna un LED
+            # ni es requisito para configurarlo o encenderlo.
+            rows = connection.execute(
+                '''SELECT p.id, p.sku, p.name, p.is_active FROM product p
+                    WHERE p.organization_id=%s AND p.is_active AND EXISTS (
+                            SELECT 1 FROM guide_product_light l
+                            JOIN led_guide_point gp ON gp.id=l.guide_point_id
+                            WHERE l.product_id=p.id AND l.branch_id=%s AND gp.shelf_id=%s)
+                    ORDER BY p.name, p.sku''',
+                (branch['organization_id'], branch_id, shelf_id)).fetchall()
+        response.headers['Cache-Control'] = 'no-store'
+        return [serialize_product(row) for row in rows]
 
     @router.get('/branches/{branch_id}/products')
     def list_products(branch_id: UUID, response: Response,
@@ -614,7 +636,9 @@ def create_router(current_user, get_connection, hub):
                   response: Response, user=Depends(current_user)):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
-            load_node(connection, branch_id, device_id, node_type='guide', lock=True)
+            node = load_node(connection, branch_id, device_id, node_type='guide', lock=True)
+            if body.channel >= int(node.get('guide_channels') or LIGHT_LIMIT):
+                raise HTTPException(422, 'El canal no existe en este nodo')
             shelf = shelf_in_branch(connection, branch_id, body.shelf_id)
             existing = connection.execute(
                 'SELECT * FROM led_guide_point WHERE node_id=%s AND led_index=%s',
@@ -655,6 +679,12 @@ def create_router(current_user, get_connection, hub):
                 (light_id, device_id)).fetchone()
             if not light:
                 raise HTTPException(404, 'Luz no encontrada en esta guía')
+            active = connection.execute(
+                '''SELECT 1 FROM led_guide_request
+                    WHERE guide_point_id=%s AND (status IN ('pending','active') OR closing)
+                    LIMIT 1''', (light_id,)).fetchone()
+            if active:
+                raise HTTPException(409, 'La luz tiene una guía activa; ciérrala antes de remapear')
             if light['led_index'] != body.channel:
                 raise HTTPException(422, 'La identidad física de la luz no puede cambiar')
             shelf = shelf_in_branch(connection, branch_id, body.shelf_id)
@@ -674,7 +704,7 @@ def create_router(current_user, get_connection, hub):
     async def test_light(branch_id: UUID, device_id: UUID, body: LightTest,
                          response: Response, user=Depends(current_user)):
         with get_connection() as connection:
-            require_branch(connection, branch_id, user)
+            require_branch_actor(connection, branch_id, user, admin=True, staff=True)
             node = load_node(connection, branch_id, device_id, node_type='guide')
             gateway = connection.execute(
                 'SELECT rpi_identifier FROM gateway WHERE id=%s AND is_active',
@@ -695,8 +725,11 @@ def create_router(current_user, get_connection, hub):
             raise HTTPException(exc.status_code, f'No se pudo enviar la prueba: {exc.detail}') from None
         if not result or result.get('ok') is not True:
             raise HTTPException(502, (result or {}).get('error') or 'La Raspberry no confirmó el envío')
+        data = result.get('data')
+        if not isinstance(data, dict) or data.get('status') not in ('applied', 'rejected', 'unknown'):
+            raise HTTPException(502, 'El gateway no devolvió un resultado válido de la prueba')
         response.headers['Cache-Control'] = 'no-store'
-        return {'confirmed': True, 'channel': body.channel}
+        return data
 
     @router.post('/branches/{branch_id}/gateways/{gateway_id}/discovery', status_code=201)
     async def start_discovery(branch_id: UUID, gateway_id: str, response: Response,

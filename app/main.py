@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 import jwt
 from fastapi import Depends, FastAPI, HTTPException, Response
@@ -15,17 +16,22 @@ from .visual_alerts import monitor as visual_alerts_monitor
 from .calibrations import CalibrationError, create_router as calibrations_router
 from .gateways import GatewayHub, create_router
 from .devices import create_router as devices_router, close_discoveries
+from .guide import create_router as guide_router, create_gateway_router as guide_gateway_router
 from .rois import create_router as rois_router
 from .pos import PosError, create_router as pos_router, error_response as pos_error_response
 from .node_registration import make_router as node_router
-from .telemetry import create_router as telemetry_router
+from .telemetry import (create_router as telemetry_router, read_occupancy, InfluxSettings, replace)
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
-from .schemas import (BranchCreateRequest, BranchCreatedResponse, LoginRequest, LoginResponse,
-                      MessageResponse, NotificationPreferences, NotificationPreferencesUpdate,
-                      PasswordChangeRequest, PendingUserResponse, ProfileUpdateRequest, RegisterRequest,
-                      RegisterResponse, UserResponse)
+from .permissions import require_branch_actor, CUSTOMER
+from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerHomeResponse, CustomerRegisterRequest, LoginRequest,
+                      LoginResponse, LogoutRequest, MessageResponse, NotificationPreferences,
+                      NotificationPreferencesUpdate, PasswordChangeRequest, PendingUserResponse,
+                      ProfileUpdateRequest, RefreshRequest, RefreshResponse,
+                      RegisterRequest, RegisterResponse, UserResponse)
+from .config import CUSTOMER_ORGANIZATION_SLUG, ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 from .security import (create_access_token, decode_access_token, hash_password,
-                       hash_registration_token, verify_password, generate_registration_token)
+                       hash_registration_token, verify_password, generate_registration_token,
+                       generate_refresh_token, hash_refresh_token, needs_rehash)
 
 gateway_hub = GatewayHub(db.get_connection,
     validate_token=lambda branch_id, digest: validate_branch_token(db.get_connection, branch_id, digest))
@@ -62,15 +68,6 @@ app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_credentials=False,
 async def pos_error_handler(_, exc):
     return pos_error_response(exc)
 
-
-@app.exception_handler(CalibrationError)
-async def calibration_error_handler(_, exc):
-    return JSONResponse(status_code=exc.status_code, content={
-        'code': exc.code,
-        'detail': exc.detail,
-        'request_id': str(uuid4()),
-    })
-
 bearer = HTTPBearer(auto_error=False)
 
 def user_response(user):
@@ -80,6 +77,26 @@ def user_response(user):
         is_superuser=user['role'].lower() == 'sudo', account_status=state,
         role=user['role'], organization_id=str(user['organization_id']),
         branch_id=str(user['branch_id']) if user['branch_id'] else None)
+
+def customer_organization(connection, requested_slug):
+    """Resuelve la organización del cliente sin atarlo a una sucursal.
+
+    Orden: slug enviado por el cliente -> CUSTOMER_ORGANIZATION_SLUG -> única
+    organización activa. Con varias organizaciones y sin slug, se rechaza para
+    no registrar al cliente en la tienda equivocada.
+    """
+    slug = (requested_slug or CUSTOMER_ORGANIZATION_SLUG or '').strip()
+    if slug:
+        row = connection.execute('SELECT id FROM organization WHERE slug=%s AND is_active', (slug,)).fetchone()
+        if not row:
+            raise HTTPException(400, 'La organización indicada no existe o está inactiva')
+        return row['id']
+    rows = connection.execute('SELECT id FROM organization WHERE is_active ORDER BY created_at LIMIT 2').fetchall()
+    if len(rows) == 1:
+        return rows[0]['id']
+    if not rows:
+        raise HTTPException(503, 'No hay una organización activa para registrar clientes')
+    raise HTTPException(400, 'El registro de clientes requiere indicar organization_slug')
 
 @app.get('/health')
 def health():
@@ -113,6 +130,28 @@ def register(request: RegisterRequest):
             raise HTTPException(409,'El correo ya está registrado')
     return RegisterResponse(message='Cuenta creada; queda pendiente de aprobación',user_id=str(user['id']),account_status='PENDING_APPROVAL')
 
+@app.post('/auth/customer-register', response_model=RegisterResponse, status_code=201)
+def customer_register(request: CustomerRegisterRequest):
+    """Autorregistro de cliente: activo de inmediato y sin sucursal fija.
+
+    El cliente queda ligado a la organización (para poder listar sus sucursales
+    después), pero `branch_id` se guarda NULL: no pertenece a una tienda.
+    """
+    with db.get_connection() as connection:
+        organization_id = customer_organization(connection, request.organization_slug)
+        try:
+            user = connection.execute('''INSERT INTO "user" (organization_id,branch_id,email,first_name,last_name,
+                phone_number,password_hash,role,account_status)
+                VALUES(%s,NULL,%s,%s,%s,%s,%s,'customer','active') RETURNING id''',
+                (organization_id,request.email.lower(),request.first_name,request.last_name,
+                 request.phone,hash_password(request.password))).fetchone()
+            connection.commit()
+        except UniqueViolation:
+            connection.rollback()
+            raise HTTPException(409,'El correo ya está registrado')
+    return RegisterResponse(message='Cuenta de cliente creada; ya puedes iniciar sesión',
+                            user_id=str(user['id']),account_status='ACTIVE')
+
 @app.post('/auth/login', response_model=LoginResponse)
 def login(request: LoginRequest):
     with db.get_connection() as connection:
@@ -121,7 +160,47 @@ def login(request: LoginRequest):
         raise HTTPException(401,'Credenciales incorrectas')
     if user['deactivated_at'] is not None or user['account_status']!='active':
         raise HTTPException(403,'La cuenta no está activa o aprobada')
-    return LoginResponse(access_token=create_access_token(str(user['id'])),user=user_response(user))
+    # Rehash transparente bcrypt → Argon2id (D-C15).
+    if needs_rehash(user['password_hash']):
+        new_hash = hash_password(request.password)
+        with db.get_connection() as connection:
+            connection.execute('UPDATE "user" SET password_hash=%s, updated_at=NOW() WHERE id=%s',
+                (new_hash, user['id']))
+            connection.commit()
+    # Crear sesión con refresh token (D-C3).
+    refresh_token = generate_refresh_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    with db.get_connection() as connection:
+        connection.execute('''INSERT INTO auth_session (user_id, refresh_token_hash, platform,
+            device_label, expires_at) VALUES (%s, %s, %s, %s, %s)''',
+            (user['id'], hash_refresh_token(refresh_token), None, None, expires_at))
+        connection.commit()
+    return LoginResponse(access_token=create_access_token(str(user['id'])),
+                         refresh_token=refresh_token,
+                         expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+                         user=user_response(user))
+
+@app.post('/auth/refresh', response_model=RefreshResponse)
+def refresh(request: RefreshRequest):
+    """Emite un nuevo access_token si el refresh_token es válido y no revocado."""
+    digest = hash_refresh_token(request.refresh_token)
+    with db.get_connection() as connection:
+        session = connection.execute('''SELECT s.id, s.user_id, s.expires_at, s.revoked_at
+            FROM auth_session s WHERE s.refresh_token_hash=%s FOR UPDATE''', (digest,)).fetchone()
+        if not session:
+            raise HTTPException(401, 'Refresh token inválido')
+        if session['revoked_at'] is not None:
+            raise HTTPException(401, 'La sesión fue cerrada')
+        if session['expires_at'] < datetime.now(timezone.utc):
+            raise HTTPException(401, 'El refresh token expiró; inicia sesión de nuevo')
+        user = connection.execute('''SELECT * FROM "user" WHERE id=%s AND account_status='active'
+            AND deactivated_at IS NULL''', (session['user_id'],)).fetchone()
+        if not user:
+            raise HTTPException(403, 'La cuenta no está activa')
+        connection.execute('UPDATE auth_session SET last_used_at=NOW() WHERE id=%s', (session['id'],))
+        connection.commit()
+    return RefreshResponse(access_token=create_access_token(str(user['id'])),
+                           expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
 
 def current_user(credentials: HTTPAuthorizationCredentials=Depends(bearer)):
     if not credentials:raise HTTPException(401,'Se requiere un token Bearer')
@@ -131,6 +210,23 @@ def current_user(credentials: HTTPAuthorizationCredentials=Depends(bearer)):
         user=connection.execute('SELECT *, (lower(role)=\'sudo\') AS is_superuser FROM "user" WHERE id=%s AND deactivated_at IS NULL',(user_id,)).fetchone()
     if not user or user['account_status']!='active':raise HTTPException(403,'La cuenta no está activa')
     return user
+
+@app.post('/auth/logout', response_model=MessageResponse)
+def logout(request: LogoutRequest = None, user=Depends(current_user)):
+    """Cierra la sesión. Si viene refresh_token, revoca solo esa; si no, revoca todas."""
+    with db.get_connection() as connection:
+        if request and request.refresh_token:
+            digest = hash_refresh_token(request.refresh_token)
+            result = connection.execute('''UPDATE auth_session SET revoked_at=NOW()
+                WHERE user_id=%s AND refresh_token_hash=%s AND revoked_at IS NULL
+                RETURNING id''', (user['id'], digest))
+            if not result.fetchone():
+                raise HTTPException(404, 'Sesión no encontrada o ya cerrada')
+        else:
+            connection.execute('''UPDATE auth_session SET revoked_at=NOW()
+                WHERE user_id=%s AND revoked_at IS NULL''', (user['id'],))
+        connection.commit()
+    return MessageResponse(message='Sesión cerrada')
 
 @app.get('/auth/me',response_model=UserResponse)
 def me(user=Depends(current_user)):
@@ -274,10 +370,25 @@ app.include_router(create_router(gateway_hub,current_user,db.get_connection))
 app.include_router(token_router(current_user,db.get_connection,gateway_hub))
 app.include_router(node_router(db.get_connection, gateway_hub, current_user))
 app.include_router(devices_router(current_user, db.get_connection, gateway_hub))
+app.include_router(guide_router(current_user, db.get_connection, gateway_hub))
+app.include_router(guide_gateway_router(db.get_connection))
 app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(calibrations_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
-app.include_router(pos_router(current_user, db.get_connection))
-app.include_router(physical_config_router(current_user, db.get_connection))
-app.include_router(roi_classification_router(current_user, db.get_connection))
+
+@app.get('/customer/home', response_model=CustomerHomeResponse)
+def customer_home(branch_id: UUID, user=Depends(current_user)):
+    with db.get_connection() as connection:
+        branch = require_branch_actor(connection, branch_id, user, customer=True)
+        nodes = connection.execute('''SELECT n.id FROM esp32_node n
+                JOIN gateway g ON g.id=n.gateway_id
+                WHERE g.branch_id=%s AND g.is_active AND n.node_code IS NOT NULL
+                  AND n.registration_status='registered' ''', (branch_id,)).fetchall()
+    settings = replace(InfluxSettings.from_env(), node_ids=tuple(str(n['id']) for n in nodes))
+    occupancy = read_occupancy(settings, branch_id)
+    return CustomerHomeResponse(branch_id=str(branch['id']), branch_name=branch['name'],
+                               occupancy=occupancy.occupancy, measured_at=occupancy.measured_at,
+                               age_seconds=occupancy.age_seconds,
+                               stale_after_seconds=occupancy.stale_after_seconds,
+                               status=occupancy.status, has_catalog=True)
 app.include_router(alerts_router(current_user, db.get_connection))
