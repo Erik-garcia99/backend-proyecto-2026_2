@@ -470,16 +470,19 @@ def create_gateway_router(get_connection):
             raise HTTPException(422, 'channels_map inválido')
         with _connection() as connection:
             gateway = connection.execute(
-                '''SELECT g.id, g.device_public_key, g.registered_with_token, g.branch_id
+                '''SELECT g.id, g.device_public_key, g.registered_with_token, g.branch_id,
+                          t.token_hash
                      FROM gateway g
                      JOIN branch b ON b.id=g.branch_id
                      JOIN organization o ON o.id=b.organization_id
+                     LEFT JOIN organization_token t ON t.id=g.registered_with_token
                     WHERE g.rpi_identifier=%s AND g.is_active AND b.is_active AND o.is_active''',
                 (gateway_id,)).fetchone()
             if not gateway or not gateway['device_public_key']:
                 raise HTTPException(403, 'Gateway no registrado o desactivado')
-            if (not gateway['registered_with_token']
-                    or not active_token(connection, gateway['registered_with_token'],
+            # registered_with_token es la FK UUID; active_token recibe el hash textual.
+            if (not gateway['token_hash']
+                    or not active_token(connection, gateway['token_hash'],
                                         gateway['branch_id'])):
                 raise HTTPException(403, 'Token de sucursal revocado')
             try:

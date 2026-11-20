@@ -54,10 +54,19 @@ class FakeConnection:
         self.occupants = []
         self.association = None
         self.active_light = False
+        self.token_valid = True
 
     def execute(self, sql, params=None):
         params = params or ()
         self.calls.append((sql, params))
+        if 'FROM organization_token t' in sql:
+            # Reproducir el fallo real text = uuid sin simular active_token.
+            if not isinstance(params[0], str):
+                raise AssertionError('token_hash debe compararse con texto, no con el UUID del token')
+            if not self.token_valid or params[0] != self.gateway_row['token_hash']:
+                return FakeCursor()
+            return FakeCursor({'id': self.gateway_row['registered_with_token'],
+                               'branch_id': BRANCH, 'organization_id': ORG})
         if 'FROM branch b' in sql:
             return FakeCursor({'id': BRANCH, 'organization_id': ORG})
         if 'FROM idempotency_key' in sql:
@@ -372,14 +381,14 @@ class CapabilitiesTests(unittest.TestCase):
         self.connection = FakeConnection()
         self.connection.gateway_row = {
             'id': GATEWAY, 'device_public_key': base64.b64encode(public).decode(),
-            'registered_with_token': uuid4(), 'branch_id': BRANCH}
+            'registered_with_token': uuid4(), 'branch_id': BRANCH,
+            'token_hash': 'a' * 64}
         self.connection.node_row = {'id': NODE}
 
     def use(self):
         patches = [
             patch.object(main.db, 'get_connection',
                          lambda: contextmanager(lambda: (yield self.connection))()),
-            patch('app.guide.active_token', return_value=True),
         ]
         for item in patches:
             item.start()
@@ -405,6 +414,33 @@ class CapabilitiesTests(unittest.TestCase):
         response = self._post(self.use())
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()['ok'])
+
+    def test_capabilities_validate_hash_not_registered_token_uuid(self):
+        response = self._post(self.use())
+        self.assertEqual(response.status_code, 200, response.text)
+        gateway_sql = next(sql for sql, _ in self.connection.calls if 'FROM gateway g' in sql)
+        self.assertIn('t.id=g.registered_with_token', gateway_sql)
+        sql, params = next((sql, params) for sql, params in self.connection.calls
+                           if 'FROM organization_token t' in sql)
+        self.assertEqual(params, ('a' * 64, BRANCH, BRANCH))
+        self.assertIn('t.token_hash=%s', sql)
+        self.assertIn('t.revoked_at IS NULL', sql)
+        self.assertIn('t.expires_at>NOW()', sql)
+        self.assertIn("'register_gateway'=ANY(t.scopes)", sql)
+
+    def test_capabilities_reject_missing_registered_token(self):
+        self.connection.gateway_row['token_hash'] = None
+        response = self._post(self.use())
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(any('UPDATE esp32_node SET guide_driver' in sql
+                             for sql, _ in self.connection.calls))
+
+    def test_capabilities_reject_inactive_token_without_updating_channels(self):
+        self.connection.token_valid = False
+        response = self._post(self.use())
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(any('UPDATE esp32_node SET guide_driver' in sql
+                             for sql, _ in self.connection.calls))
 
     def test_tampered_signature_is_rejected(self):
         response = self._post(self.use(), tamper=True)
