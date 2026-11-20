@@ -165,6 +165,50 @@ class CustomerHomeTests(unittest.TestCase):
             response = self.client.get('/customer/branches', headers={'Authorization': 'Bearer fake'})
         self.assertEqual(response.status_code, 403)
 
+    def test_customer_categories_returns_list(self):
+        self.auth_header()
+        connection = FakeConnection(results=[
+            [{'id': BRANCH, 'organization_id': ORG}],  # require_branch_actor
+            [{'name': 'Bebidas'}, {'name': 'Lácteos'}],  # categories
+        ])
+        with self.use_connection(connection):
+            response = self.client.get(f'/customer/branches/{BRANCH}/categories', headers={'Authorization': 'Bearer fake'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['categories'], ['Bebidas', 'Lácteos'])
+
+    def test_customer_products_returns_catalog_with_availability(self):
+        self.auth_header()
+        p1 = {
+            'id': UUID('11111111-1111-4111-8111-111111111111'),
+            'name': 'Leche Entera 1L',
+            'sku': 'LEC-001',
+            'barcode': '7501234567890',
+            'description': 'Leche pasteurizada',
+            'sale_price': 28.50,
+            'category_name': 'Lácteos',
+            'shelf_id': UUID('22222222-2222-4222-8222-222222222222'),
+            'shelf_name': 'Estante A1',
+            'location_label': 'Pasillo 2',
+            'has_guide': True,
+            'roi_status': 'adequate',
+        }
+        connection = FakeConnection(results=[
+            [{'id': BRANCH, 'organization_id': ORG}],  # require_branch_actor
+            {'total': 1},                              # count
+            [p1],                                      # rows
+        ])
+        with self.use_connection(connection):
+            response = self.client.get(f'/customer/branches/{BRANCH}/products?q=Leche', headers={'Authorization': 'Bearer fake'})
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data['total'], 1)
+        item = data['items'][0]
+        self.assertEqual(item['name'], 'Leche Entera 1L')
+        self.assertEqual(item['sale_price'], 28.50)
+        self.assertEqual(item['has_guide'], True)
+        self.assertEqual(item['availability'], 'available')
+        self.assertEqual(item['availability_label'], 'Disponible en repisa')
+
 
 if __name__ == '__main__':
     unittest.main()
