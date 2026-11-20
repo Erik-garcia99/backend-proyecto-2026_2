@@ -95,6 +95,41 @@ class CatalogBase(unittest.TestCase):
 
 
 class ProductTests(CatalogBase):
+    def test_shelf_products_are_scoped_to_location_and_organization(self):
+        def handler(sql, params):
+            if 'SELECT id, name FROM shelf' in sql:
+                self.assertEqual(params, (SHELF, BRANCH))
+                return result(row={'id': SHELF, 'name': 'Estante 1'})
+            self.assertNotIn('roi', sql.lower())
+            self.assertNotIn('camera', sql.lower())
+            self.assertIn('l.branch_id=%s AND gp.shelf_id=%s', sql)
+            self.assertEqual(params, (ORG, BRANCH, SHELF))
+            return result(rows=[product_row()])
+
+        response = self.client(FakeConnection(handler)).get(
+            f'/branches/{BRANCH}/shelves/{SHELF}/products')
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()[0]['name'], 'Leche entera')
+        self.assertEqual(response.headers['cache-control'], 'no-store')
+
+    def test_shelf_without_products_returns_empty_not_entire_catalog(self):
+        def handler(sql, params):
+            if 'SELECT id, name FROM shelf' in sql:
+                return result(row={'id': SHELF, 'name': 'Vacío'})
+            return result(rows=[])
+
+        response = self.client(FakeConnection(handler)).get(
+            f'/branches/{BRANCH}/shelves/{SHELF}/products')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), [])
+
+    def test_shelf_products_reject_unknown_or_other_branch_shelf(self):
+        connection = FakeConnection(lambda sql, params: result(row=None))
+        response = self.client(connection).get(
+            f'/branches/{BRANCH}/shelves/{SHELF}/products')
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(len(connection.calls), 1)
+
     def test_lists_active_products_of_the_organization_with_search(self):
         connection = FakeConnection(lambda sql, params: result(rows=[product_row()]))
         response = self.client(connection).get(
