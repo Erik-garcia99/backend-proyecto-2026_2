@@ -471,6 +471,28 @@ def create_router(current_user, get_connection, hub):
 
     # --- Fase 3: catálogo mínimo de productos y vínculo cámara-repisa ---
 
+    @router.get('/branches/{branch_id}/shelves/{shelf_id}/products')
+    def list_shelf_products(branch_id: UUID, shelf_id: UUID, response: Response,
+                            user=Depends(current_user)):
+        with get_connection() as connection:
+            branch = require_branch(connection, branch_id, user)
+            shelf_in_branch(connection, branch_id, shelf_id)
+            # La ubicación proviene de las zonas registradas o de una asociación
+            # de guía existente, no de todo el catálogo de la organización.
+            rows = connection.execute(
+                '''SELECT p.id, p.sku, p.name, p.is_active FROM product p
+                    WHERE p.organization_id=%s AND p.is_active AND (
+                        EXISTS (SELECT 1 FROM roi r
+                                 WHERE r.product_id=p.id AND r.shelf_id=%s AND r.is_active)
+                        OR EXISTS (
+                            SELECT 1 FROM guide_product_light l
+                            JOIN led_guide_point gp ON gp.id=l.guide_point_id
+                            WHERE l.product_id=p.id AND l.branch_id=%s AND gp.shelf_id=%s))
+                    ORDER BY p.name, p.sku''',
+                (branch['organization_id'], shelf_id, branch_id, shelf_id)).fetchall()
+        response.headers['Cache-Control'] = 'no-store'
+        return [serialize_product(row) for row in rows]
+
     @router.get('/branches/{branch_id}/products')
     def list_products(branch_id: UUID, response: Response,
                       search: str | None = Query(default=None, max_length=100),
