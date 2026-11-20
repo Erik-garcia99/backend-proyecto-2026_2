@@ -256,6 +256,29 @@ class GuideApiTests(unittest.TestCase):
             second = client.delete(f'/branches/{BRANCH}/guide-requests/{request_id}').json()
         self.assertEqual(first, second)
 
+    def test_gateway_wait_stays_below_mobile_timeout(self):
+        """La app aborta a los 15 s: start y stop no deben retener la respuesta."""
+        seen = []
+
+        async def applied(*_args, **kwargs):
+            seen.append(kwargs.get('timeout'))
+            return {'ok': True, 'data': {'delivery': 'applied', 'light': 'on'}}
+
+        client = self.use(user(), hub_send=applied)
+        request_id = self._create(client).json()['id']
+
+        async def closed(*_args, **kwargs):
+            seen.append(kwargs.get('timeout'))
+            return {'ok': True, 'data': {'delivery': 'applied', 'light': 'off'}}
+
+        with patch.object(self.hub, 'send', new_callable=AsyncMock, side_effect=closed):
+            response = client.delete(f'/branches/{BRANCH}/guide-requests/{request_id}')
+        self.assertEqual(response.status_code, 202, response.text)
+        self.assertEqual(len(seen), 2)
+        for timeout in seen:
+            self.assertIsNotNone(timeout)
+            self.assertLessEqual(timeout, 15)
+
     def test_missing_destination_and_missing_capabilities(self):
         client = self.use(user(), connection=FakeConnection(destination=False))
         self.assertEqual(self._create(client).status_code, 404)

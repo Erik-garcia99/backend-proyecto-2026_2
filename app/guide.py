@@ -29,6 +29,10 @@ def _connection():
 TTL_MS = 60000
 ACCEPT_WINDOW_MS = 3000
 MAX_WAIT_SECONDS = 65
+# La app aborta a los 15 s (services/http.js). Ninguna orden puede retener la
+# respuesta HTTP más que eso: si el nodo no contesta, se responde 202 con la
+# solicitud en `pending` y el polling decide después.
+START_WAIT_SECONDS = 10
 CLOSE_WAIT_SECONDS = 10
 IDEMPOTENCY_RE = re.compile(r'^[A-Za-z0-9_-]{8,64}$')
 BOOT_RE = re.compile(r'^[0-9a-f]{8}$')
@@ -215,7 +219,8 @@ def create_router(current_user, get_connection, hub):
         outcome = None
         try:
             outcome = await hub.send(dest['rpi_identifier'], 'guide.start',
-                                     payload=_command_payload(row))
+                                     payload=_command_payload(row),
+                                     timeout=START_WAIT_SECONDS)
         except Exception:
             outcome = None
         status, light, reason = 'pending', 'unknown', None
@@ -298,8 +303,13 @@ def create_router(current_user, get_connection, hub):
 
         outcome = None
         try:
+            # No bloquear al cliente más que la ventana de reconciliación: si el
+            # nodo no responde, se devuelve 202 con closing=true y el polling
+            # marca off_unverified. Antes se esperaban 60 s y la app abortaba a
+            # los 15 s mostrando un falso "no se pudo conectar".
             outcome = await hub.send(row['gateway_rpi'], 'guide.stop',
-                                     payload=_command_payload(row))
+                                     payload=_command_payload(row),
+                                     timeout=CLOSE_WAIT_SECONDS)
         except Exception:
             outcome = None
         data = outcome.get('data') if isinstance(outcome, dict) else None
