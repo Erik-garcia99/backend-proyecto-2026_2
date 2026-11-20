@@ -100,9 +100,10 @@ class ProductTests(CatalogBase):
             if 'SELECT id, name FROM shelf' in sql:
                 self.assertEqual(params, (SHELF, BRANCH))
                 return result(row={'id': SHELF, 'name': 'Estante 1'})
-            self.assertIn('r.shelf_id=%s AND r.is_active', sql)
+            self.assertNotIn('roi', sql.lower())
+            self.assertNotIn('camera', sql.lower())
             self.assertIn('l.branch_id=%s AND gp.shelf_id=%s', sql)
-            self.assertEqual(params, (ORG, SHELF, BRANCH, SHELF))
+            self.assertEqual(params, (ORG, BRANCH, SHELF))
             return result(rows=[product_row()])
 
         response = self.client(FakeConnection(handler)).get(
