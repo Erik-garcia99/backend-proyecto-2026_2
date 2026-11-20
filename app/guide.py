@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import db
@@ -37,6 +38,12 @@ MODULE = 'shelf_monitor'
 class GuideCreate(BaseModel):
     model_config = ConfigDict(extra='forbid')
     product_id: UUID
+
+
+class GuideAssociationCreate(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    product_id: UUID
+    guide_point_id: UUID
 
 
 class GuideCapabilities(BaseModel):
@@ -119,14 +126,14 @@ def _resolve(connection, branch_id, product_id, organization_id):
         '''SELECT gp.id AS guide_point_id, gp.led_index, gp.node_id,
                   g.rpi_identifier, s.name AS shelf_name, s.location_label,
                   n.guide_channels
-             FROM product p
-             JOIN roi r ON r.product_id=p.id AND r.is_active
-             JOIN shelf s ON s.id=r.shelf_id AND s.is_active AND s.branch_id=%s
-             JOIN led_guide_point gp ON gp.shelf_id=s.id
+             FROM guide_product_light lpl
+             JOIN product p ON p.id=lpl.product_id AND p.is_active
+             JOIN led_guide_point gp ON gp.id=lpl.guide_point_id
+             LEFT JOIN shelf s ON s.id=gp.shelf_id
              JOIN esp32_node n ON n.id=gp.node_id AND n.node_type='guide'
                   AND n.registration_status='registered'
              JOIN gateway g ON g.id=n.gateway_id AND g.is_active AND g.branch_id=%s
-            WHERE p.id=%s AND p.is_active AND p.organization_id=%s''',
+            WHERE lpl.branch_id=%s AND lpl.product_id=%s AND p.organization_id=%s''',
         (branch_id, branch_id, product_id, organization_id)).fetchall()
     if not rows:
         raise HTTPException(404, 'guide_association_missing')
@@ -322,6 +329,91 @@ def create_router(current_user, get_connection, hub):
     async def cancel_guide(branch_id: UUID, request_id: UUID, response: Response,
                            user=Depends(current_user)):
         return await _close(branch_id, request_id, response, user, 'cancel')
+
+    # --- Asociaciones propias de la guía (independientes de la cámara/ROI) ---
+    @router.get('/branches/{branch_id}/guide-associations')
+    def list_associations(branch_id: UUID, response: Response, user=Depends(current_user)):
+        with _connection() as connection:
+            require_branch_actor(connection, branch_id, user, admin=True)
+            rows = connection.execute(
+                '''SELECT gp.id AS guide_point_id, gp.name AS light_name, gp.led_index,
+                          s.id AS shelf_id, s.name AS shelf_name,
+                          p.id AS product_id, p.name AS product_name, p.sku
+                     FROM guide_product_light lpl
+                     JOIN led_guide_point gp ON gp.id=lpl.guide_point_id
+                     LEFT JOIN shelf s ON s.id=gp.shelf_id
+                     JOIN product p ON p.id=lpl.product_id
+                    WHERE lpl.branch_id=%s
+                    ORDER BY s.name, gp.led_index, p.name''',
+                (branch_id,)).fetchall()
+        _no_store(response)
+        return [{'guidePointId': str(row['guide_point_id']), 'lightName': row['light_name'],
+                 'channel': int(row['led_index']), 'shelfId': str(row['shelf_id']) if row['shelf_id'] else None,
+                 'shelfName': row['shelf_name'], 'productId': str(row['product_id']),
+                 'productName': row['product_name'], 'sku': row['sku']} for row in rows]
+
+    @router.post('/branches/{branch_id}/guide-associations', status_code=201)
+    def assign_product(branch_id: UUID, body: GuideAssociationCreate, response: Response,
+                       user=Depends(current_user)):
+        with _connection() as connection:
+            branch = require_branch_actor(connection, branch_id, user, admin=True)
+            point = connection.execute(
+                '''SELECT gp.id, s.name AS shelf_name
+                     FROM led_guide_point gp
+                     JOIN esp32_node n ON n.id=gp.node_id AND n.node_type='guide'
+                     JOIN gateway g ON g.id=n.gateway_id AND g.is_active AND g.branch_id=%s
+                     LEFT JOIN shelf s ON s.id=gp.shelf_id
+                    WHERE gp.id=%s''', (branch_id, body.guide_point_id)).fetchone()
+            if not point:
+                raise HTTPException(404, 'Luz de guía no encontrada en esta sucursal')
+            product = connection.execute(
+                '''SELECT id, name, sku FROM product
+                    WHERE id=%s AND is_active AND organization_id=%s''',
+                (body.product_id, branch['organization_id'])).fetchone()
+            if not product:
+                raise HTTPException(404, 'Producto no encontrado en esta sucursal')
+            current = connection.execute(
+                '''SELECT guide_point_id FROM guide_product_light
+                    WHERE branch_id=%s AND product_id=%s''',
+                (branch_id, body.product_id)).fetchone()
+            body_out = {'guidePointId': str(body.guide_point_id), 'productId': str(body.product_id),
+                        'productName': product['name'], 'lightName': point['shelf_name']}
+            if current:
+                if current['guide_point_id'] == body.guide_point_id:
+                    _no_store(response)
+                    return body_out
+                raise HTTPException(409, 'El producto ya está asociado a otra luz de la guía')
+            try:
+                connection.execute(
+                    '''INSERT INTO guide_product_light
+                           (branch_id, product_id, guide_point_id, created_by)
+                       VALUES (%s,%s,%s,%s)''',
+                    (branch_id, body.product_id, body.guide_point_id, user['id']))
+                connection.commit()
+            except UniqueViolation:
+                connection.rollback()
+                raise HTTPException(409, 'El producto ya está asociado a otra luz de la guía') from None
+        _no_store(response)
+        return body_out
+
+    @router.delete('/branches/{branch_id}/guide-associations/{product_id}', status_code=204)
+    def unassign_product(branch_id: UUID, product_id: UUID, user=Depends(current_user)):
+        with _connection() as connection:
+            require_branch_actor(connection, branch_id, user, admin=True)
+            active = connection.execute(
+                '''SELECT 1 FROM led_guide_request
+                    WHERE branch_id=%s AND product_id=%s
+                      AND (status IN ('pending','active') OR closing) LIMIT 1''',
+                (branch_id, product_id)).fetchone()
+            if active:
+                raise HTTPException(409, 'El producto tiene una guía activa; ciérrala antes de desasociarlo')
+            cursor = connection.execute(
+                '''DELETE FROM guide_product_light
+                    WHERE branch_id=%s AND product_id=%s''', (branch_id, product_id))
+            if not getattr(cursor, 'rowcount', 1):
+                raise HTTPException(404, 'El producto no estaba asociado a ninguna luz')
+            connection.commit()
+        return Response(status_code=204)
 
     return router
 

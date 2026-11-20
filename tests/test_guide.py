@@ -67,13 +67,30 @@ class FakeConnection:
         if 'UPDATE idempotency_key' in sql:
             self.idempotency[params[2]]['response'] = params[0]
             return FakeCursor()
-        if 'JOIN roi r' in sql:
+        if 'FROM guide_product_light' in sql and 'JOIN' in sql and 'ORDER BY' in sql:
+            return FakeCursor(rows=[{
+                'guide_point_id': POINT, 'light_name': 'Luz 3', 'led_index': 2,
+                'shelf_id': None, 'shelf_name': 'Estante 3',
+                'product_id': PRODUCT, 'product_name': 'Agua', 'sku': 'SKU-1'}])
+        if 'FROM guide_product_light' in sql and 'lpl.product_id' in sql:
             if not self.destination:
                 return FakeCursor(rows=[])
             return FakeCursor(row={
                 'guide_point_id': POINT, 'led_index': 2, 'node_id': NODE,
                 'rpi_identifier': RPI, 'shelf_name': 'Estante 3',
                 'location_label': 'Pasillo central', 'guide_channels': self.channels})
+        if 'FROM guide_product_light' in sql and 'WHERE branch_id=%s AND product_id=%s' in sql:
+            return FakeCursor(None)
+        if 'FROM led_guide_point gp' in sql:
+            return FakeCursor({'id': POINT, 'shelf_name': 'Estante 3'})
+        if 'FROM product' in sql and 'is_active' in sql:
+            return FakeCursor({'id': PRODUCT, 'name': 'Agua', 'sku': 'SKU-1'})
+        if 'INSERT INTO guide_product_light' in sql:
+            return FakeCursor()
+        if 'DELETE FROM guide_product_light' in sql:
+            cursor = FakeCursor()
+            cursor.rowcount = 1
+            return cursor
         if 'INSERT INTO led_guide_request' in sql:
             keys = ['id', 'branch_id', 'customer_id', 'requester_user_id', 'product_id',
                     'guide_point_id', 'node_id', 'led_index', 'gateway_rpi', 'session_id',
@@ -228,6 +245,33 @@ class GuideApiTests(unittest.TestCase):
         self.assertEqual(self._create(client).status_code, 404)
         client = self.use(user(), connection=FakeConnection(channels=None))
         self.assertEqual(self._create(client).status_code, 503)
+
+    def test_resolution_never_touches_roi(self):
+        client = self.use(user())
+        self._create(client)
+        executed = ' '.join(sql for sql, _ in self.connection.calls)
+        self.assertNotIn('roi', executed)
+        self.assertIn('guide_product_light', executed)
+
+    def test_association_crud_is_staff_only_and_independent_of_roi(self):
+        owner = user('owner', OWNER)
+        client = self.use(owner)
+        listed = client.get(f'/branches/{BRANCH}/guide-associations')
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(listed.json()[0]['productId'], str(PRODUCT))
+        assigned = client.post(f'/branches/{BRANCH}/guide-associations',
+                               json={'product_id': str(PRODUCT), 'guide_point_id': str(POINT)})
+        self.assertEqual(assigned.status_code, 201, assigned.text)
+        removed = client.delete(f'/branches/{BRANCH}/guide-associations/{PRODUCT}')
+        self.assertEqual(removed.status_code, 204, removed.text)
+
+        employee = self.use(user('employee', OWNER))
+        for response in (
+            employee.get(f'/branches/{BRANCH}/guide-associations'),
+            employee.post(f'/branches/{BRANCH}/guide-associations',
+                          json={'product_id': str(PRODUCT), 'guide_point_id': str(POINT)}),
+        ):
+            self.assertEqual(response.status_code, 403)
 
     def test_invalid_body_and_key(self):
         client = self.use(user())
