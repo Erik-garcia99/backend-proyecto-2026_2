@@ -13,11 +13,13 @@ from .alerts import create_router as alerts_router, monitor as alerts_monitor
 from .calibrations import CalibrationError, create_router as calibrations_router
 from .gateways import GatewayHub, create_router
 from .devices import create_router as devices_router, close_discoveries
+from .guide import create_router as guide_router, create_gateway_router as guide_gateway_router
 from .rois import create_router as rois_router
 from .pos import PosError, create_router as pos_router, error_response as pos_error_response
 from .node_registration import make_router as node_router
 from .telemetry import (create_router as telemetry_router, read_occupancy, InfluxSettings, replace)
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
+from .permissions import require_branch_actor, CUSTOMER
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerHomeResponse, CustomerRegisterRequest, LoginRequest,
                       LoginResponse, LogoutRequest, MessageResponse, NotificationPreferences,
                       NotificationPreferencesUpdate, PasswordChangeRequest, PendingUserResponse,
@@ -360,22 +362,16 @@ app.include_router(create_router(gateway_hub,current_user,db.get_connection))
 app.include_router(token_router(current_user,db.get_connection,gateway_hub))
 app.include_router(node_router(db.get_connection, gateway_hub, current_user))
 app.include_router(devices_router(current_user, db.get_connection, gateway_hub))
+app.include_router(guide_router(current_user, db.get_connection, gateway_hub))
+app.include_router(guide_gateway_router(db.get_connection))
 app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(calibrations_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
 
 @app.get('/customer/home', response_model=CustomerHomeResponse)
 def customer_home(branch_id: UUID, user=Depends(current_user)):
-    if user['role'].lower() != 'customer' and not user['is_superuser']:
-        raise HTTPException(403, 'Solo los clientes consultan el aforo desde la app')
     with db.get_connection() as connection:
-        branch = connection.execute('''SELECT b.id, b.name, b.organization_id
-                FROM branch b JOIN organization o ON o.id=b.organization_id
-                WHERE b.id=%s AND b.is_active AND o.is_active''', (branch_id,)).fetchone()
-        if not branch:
-            raise HTTPException(404, 'Sucursal no encontrada o inactiva')
-        if not user['is_superuser'] and branch['organization_id'] != user['organization_id']:
-            raise HTTPException(403, 'No tienes acceso a esta sucursal')
+        branch = require_branch_actor(connection, branch_id, user, customer=True)
         nodes = connection.execute('''SELECT n.id FROM esp32_node n
                 JOIN gateway g ON g.id=n.gateway_id
                 WHERE g.branch_id=%s AND g.is_active AND n.node_code IS NOT NULL

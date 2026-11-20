@@ -25,6 +25,7 @@ from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field
 
 from .registration_tokens import require_branch_access
+from .permissions import require_branch_actor
 
 LIGHT_LIMIT = 10
 DISCOVERY_TIMEOUT_SECONDS = 120
@@ -439,12 +440,14 @@ def create_router(current_user, get_connection, hub):
     def light_channels(branch_id: UUID, device_id: UUID, response: Response, user=Depends(current_user)):
         with get_connection() as connection:
             require_branch(connection, branch_id, user)
-            load_node(connection, branch_id, device_id, node_type='guide')
+            node = load_node(connection, branch_id, device_id, node_type='guide')
             used = {row['led_index'] for row in connection.execute(
                 'SELECT led_index FROM led_guide_point WHERE node_id=%s', (device_id,)).fetchall()}
+        capacity = node.get('guide_channels')
+        available_range = range(int(capacity)) if capacity else range(0)
         response.headers['Cache-Control'] = 'no-store'
         return [{'id': channel, 'label': f'Luz {channel + 1}', 'available': channel not in used}
-                for channel in range(LIGHT_LIMIT)]
+                for channel in available_range]
 
     @router.get('/branches/{branch_id}/shelves')
     def list_shelves(branch_id: UUID, response: Response, user=Depends(current_user)):
@@ -655,6 +658,12 @@ def create_router(current_user, get_connection, hub):
                 (light_id, device_id)).fetchone()
             if not light:
                 raise HTTPException(404, 'Luz no encontrada en esta guía')
+            active = connection.execute(
+                '''SELECT 1 FROM led_guide_request
+                    WHERE guide_point_id=%s AND (status IN ('pending','active') OR closing)
+                    LIMIT 1''', (light_id,)).fetchone()
+            if active:
+                raise HTTPException(409, 'La luz tiene una guía activa; ciérrala antes de remapear')
             if light['led_index'] != body.channel:
                 raise HTTPException(422, 'La identidad física de la luz no puede cambiar')
             shelf = shelf_in_branch(connection, branch_id, body.shelf_id)
@@ -674,7 +683,7 @@ def create_router(current_user, get_connection, hub):
     async def test_light(branch_id: UUID, device_id: UUID, body: LightTest,
                          response: Response, user=Depends(current_user)):
         with get_connection() as connection:
-            require_branch(connection, branch_id, user)
+            require_branch_actor(connection, branch_id, user, admin=True, staff=True)
             node = load_node(connection, branch_id, device_id, node_type='guide')
             gateway = connection.execute(
                 'SELECT rpi_identifier FROM gateway WHERE id=%s AND is_active',
@@ -695,8 +704,11 @@ def create_router(current_user, get_connection, hub):
             raise HTTPException(exc.status_code, f'No se pudo enviar la prueba: {exc.detail}') from None
         if not result or result.get('ok') is not True:
             raise HTTPException(502, (result or {}).get('error') or 'La Raspberry no confirmó el envío')
+        data = result.get('data')
+        if not isinstance(data, dict) or data.get('status') not in ('applied', 'rejected', 'unknown'):
+            raise HTTPException(502, 'El gateway no devolvió un resultado válido de la prueba')
         response.headers['Cache-Control'] = 'no-store'
-        return {'confirmed': True, 'channel': body.channel}
+        return data
 
     @router.post('/branches/{branch_id}/gateways/{gateway_id}/discovery', status_code=201)
     async def start_discovery(branch_id: UUID, gateway_id: str, response: Response,
