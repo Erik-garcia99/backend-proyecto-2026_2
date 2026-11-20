@@ -72,7 +72,7 @@ class FakeConnection:
             return FakeCursor()
         if 'FROM guide_product_light' in sql and 'JOIN' in sql and 'ORDER BY' in sql:
             return FakeCursor(rows=[{
-                'guide_point_id': POINT, 'light_name': 'Luz 3', 'led_index': 2,
+                'guide_point_id': POINT, 'light_name': 'Luz 3', 'led_index': 2, 'node_id': NODE,
                 'shelf_id': None, 'shelf_name': 'Estante 3',
                 'product_id': PRODUCT, 'product_name': 'Agua', 'sku': 'SKU-1'}])
         if 'FROM guide_product_light' in sql and 'lpl.product_id' in sql:
@@ -266,6 +266,7 @@ class GuideApiTests(unittest.TestCase):
         listed = client.get(f'/branches/{BRANCH}/guide-associations')
         self.assertEqual(listed.status_code, 200, listed.text)
         self.assertEqual(listed.json()[0]['productId'], str(PRODUCT))
+        self.assertEqual(listed.json()[0]['nodeId'], str(NODE))
         assigned = client.post(f'/branches/{BRANCH}/guide-associations',
                                json={'product_id': str(PRODUCT), 'guide_point_id': str(POINT)})
         self.assertEqual(assigned.status_code, 201, assigned.text)
@@ -273,12 +274,36 @@ class GuideApiTests(unittest.TestCase):
         self.assertEqual(removed.status_code, 204, removed.text)
 
         employee = self.use(user('employee', OWNER))
+        self.assertEqual(employee.get(f'/branches/{BRANCH}/guide-associations').status_code, 200)
         for response in (
-            employee.get(f'/branches/{BRANCH}/guide-associations'),
             employee.post(f'/branches/{BRANCH}/guide-associations',
                           json={'product_id': str(PRODUCT), 'guide_point_id': str(POINT)}),
+            employee.delete(f'/branches/{BRANCH}/guide-associations/{PRODUCT}'),
         ):
             self.assertEqual(response.status_code, 403)
+
+    def test_employee_can_turn_on_and_off_without_roi(self):
+        async def applied(*_args, **_kwargs):
+            return {'ok': True, 'data': {'delivery': 'applied', 'light': 'on'}}
+        client = self.use(user('employee', OWNER), hub_send=applied)
+        started = self._create(client)
+        self.assertEqual(started.status_code, 202, started.text)
+        self.assertEqual(started.json()['light'], 'on')
+        async def off(*_args, **_kwargs):
+            return {'ok': True, 'data': {'delivery': 'applied', 'light': 'off'}}
+        with patch.object(self.hub, 'send', new_callable=AsyncMock, side_effect=off):
+            stopped = client.delete(f'/branches/{BRANCH}/guide-requests/{started.json()["id"]}')
+        self.assertEqual(stopped.status_code, 202, stopped.text)
+        self.assertEqual(stopped.json()['light'], 'off')
+        self.assertNotIn('roi', ' '.join(sql for sql, _ in self.connection.calls).lower())
+
+    def test_customer_and_foreign_employee_cannot_list_associations(self):
+        client = self.use(user())
+        self.assertEqual(client.get(f'/branches/{BRANCH}/guide-associations').status_code, 403)
+        other = user('employee', OWNER)
+        other['branch_id'] = ORG
+        client = self.use(other)
+        self.assertEqual(client.get(f'/branches/{BRANCH}/guide-associations').status_code, 403)
 
     def test_invalid_body_and_key(self):
         client = self.use(user())

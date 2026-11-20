@@ -336,20 +336,24 @@ def create_router(current_user, get_connection, hub):
     @router.get('/branches/{branch_id}/guide-associations')
     def list_associations(branch_id: UUID, response: Response, user=Depends(current_user)):
         with _connection() as connection:
-            require_branch_actor(connection, branch_id, user, admin=True)
+            branch = require_branch_actor(connection, branch_id, user, admin=True, staff=True)
             rows = connection.execute(
-                '''SELECT gp.id AS guide_point_id, gp.name AS light_name, gp.led_index,
+                '''SELECT gp.id AS guide_point_id, gp.name AS light_name, gp.led_index, gp.node_id,
                           s.id AS shelf_id, s.name AS shelf_name,
                           p.id AS product_id, p.name AS product_name, p.sku
                      FROM guide_product_light lpl
                      JOIN led_guide_point gp ON gp.id=lpl.guide_point_id
+                     JOIN esp32_node n ON n.id=gp.node_id AND n.node_type='guide'
+                          AND n.registration_status='registered'
+                     JOIN gateway g ON g.id=n.gateway_id AND g.is_active AND g.branch_id=lpl.branch_id
                      LEFT JOIN shelf s ON s.id=gp.shelf_id
-                     JOIN product p ON p.id=lpl.product_id
-                    WHERE lpl.branch_id=%s
+                     JOIN product p ON p.id=lpl.product_id AND p.is_active
+                    WHERE lpl.branch_id=%s AND p.organization_id=%s
                     ORDER BY s.name, gp.led_index, p.name''',
-                (branch_id,)).fetchall()
+                (branch_id, branch['organization_id'])).fetchall()
         _no_store(response)
         return [{'guidePointId': str(row['guide_point_id']), 'lightName': row['light_name'],
+                 'nodeId': str(row['node_id']),
                  'channel': int(row['led_index']), 'shelfId': str(row['shelf_id']) if row['shelf_id'] else None,
                  'shelfName': row['shelf_name'], 'productId': str(row['product_id']),
                  'productName': row['product_name'], 'sku': row['sku']} for row in rows]
