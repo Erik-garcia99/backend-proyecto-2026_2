@@ -256,6 +256,45 @@ class GuideApiTests(unittest.TestCase):
             second = client.delete(f'/branches/{BRANCH}/guide-requests/{request_id}').json()
         self.assertEqual(first, second)
 
+    def test_busy_channel_returns_409_not_500(self):
+        """psycopg3 usa `sqlstate`; con `pgcode` el 409 se convertía en 500."""
+        class Busy(FakeConnection):
+            def execute(self, sql, params=None):
+                if 'INSERT INTO led_guide_request' in sql:
+                    error = Exception('duplicate key value violates unique constraint')
+                    error.sqlstate = '23505'
+                    raise error
+                return super().execute(sql, params)
+
+        client = self.use(user(), connection=Busy())
+        response = self._create(client)
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()['detail'], 'guide_channel_busy')
+
+    def test_stale_reservation_is_released_before_reserving(self):
+        """Un `active` viejo o un cierre abandonado no pueden bloquear el canal."""
+        client = self.use(user())
+        response = self._create(client)
+        self.assertEqual(response.status_code, 202, response.text)
+        releases = [sql for sql, _ in self.connection.calls
+                    if "status = CASE WHEN closing THEN 'failed'" in sql]
+        self.assertEqual(len(releases), 1)
+        self.assertIn("reason = CASE WHEN closing THEN 'off_unverified' ELSE 'ttl'", releases[0])
+
+    def test_read_guide_expires_active_session_past_its_ttl(self):
+        async def applied(*_args, **_kwargs):
+            return {'ok': True, 'data': {'delivery': 'applied', 'light': 'on'}}
+
+        client = self.use(user(), hub_send=applied)
+        request_id = UUID(self._create(client).json()['id'])
+        self.connection.requests[request_id].update({
+            'status': 'active', 'light': 'on',
+            'expires_at': NOW - timedelta(seconds=61)})
+        body = client.get(f'/branches/{BRANCH}/guide-requests/{request_id}').json()
+        self.assertEqual(body['status'], 'expired')
+        self.assertEqual(body['reason'], 'ttl')
+        self.assertEqual(body['light'], 'unknown')
+
     def test_gateway_wait_stays_below_mobile_timeout(self):
         """La app aborta a los 15 s: start y stop no deben retener la respuesta."""
         seen = []

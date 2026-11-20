@@ -34,6 +34,9 @@ MAX_WAIT_SECONDS = 65
 # solicitud en `pending` y el polling decide después.
 START_WAIT_SECONDS = 10
 CLOSE_WAIT_SECONDS = 10
+# Margen sobre el TTL antes de dar por libre un canal. El nodo cuenta su TTL
+# desde accept_ms, que va unos segundos por delante de expires_at.
+RESERVATION_GRACE_SECONDS = 5
 IDEMPOTENCY_RE = re.compile(r'^[A-Za-z0-9_-]{8,64}$')
 BOOT_RE = re.compile(r'^[0-9a-f]{8}$')
 MODULE = 'shelf_monitor'
@@ -126,6 +129,31 @@ def _command_payload(row):
             'accept_window_ms': ACCEPT_WINDOW_MS}
 
 
+def _release_stale(connection, node_id, led_index, now):
+    """Libera reservas de un canal que ya no pueden seguir vivas.
+
+    El nodo apaga por su cuenta al cumplir su TTL, y un cierre solo espera
+    `CLOSE_WAIT_SECONDS`; si nadie consulta la solicitud, la fila se queda en
+    `active`/`pending`/`closing` y el índice único
+    `led_guide_request_active_channel` bloquearía ese canal para siempre.
+    """
+    connection.execute(
+        '''UPDATE led_guide_request
+              SET status = CASE WHEN closing THEN 'failed' ELSE 'expired' END,
+                  reason = CASE WHEN closing THEN 'off_unverified' ELSE 'ttl' END,
+                  light = 'unknown',
+                  closing = FALSE,
+                  ended_at = COALESCE(ended_at, NOW()),
+                  updated_at = NOW()
+            WHERE node_id=%s AND led_index=%s
+              AND ((closing AND COALESCE(updated_at, NOW()) < %s)
+                OR (NOT closing AND status IN ('pending', 'active')
+                    AND COALESCE(expires_at, requested_at) < %s))''',
+        (node_id, led_index,
+         now - timedelta(seconds=CLOSE_WAIT_SECONDS + RESERVATION_GRACE_SECONDS),
+         now - timedelta(seconds=RESERVATION_GRACE_SECONDS)))
+
+
 def _resolve(connection, branch_id, product_id, organization_id):
     rows = connection.execute(
         '''SELECT gp.id AS guide_point_id, gp.led_index, gp.node_id,
@@ -183,6 +211,8 @@ def create_router(current_user, get_connection, hub):
             dest = _resolve(connection, branch_id, body.product_id,
                             branch['organization_id'])
             now = _now()
+            # Antes de reservar: libera lo que el nodo ya apagó por TTL.
+            _release_stale(connection, dest['node_id'], int(dest['led_index']), now)
             request_id = uuid4()
             session_id = uuid4()
             command_id = 'gd-' + uuid4().hex[:16]
@@ -211,7 +241,10 @@ def create_router(current_user, get_connection, hub):
                      dest['shelf_name'], dest['location_label'])).fetchone()
             except Exception as exc:
                 connection.rollback()
-                if getattr(exc, 'pgcode', None) == '23505':
+                # psycopg3 expone `sqlstate`; `pgcode` es de psycopg2. Sin
+                # esto, un canal ocupado devolvía 500 en vez de 409.
+                if ('23505' in (getattr(exc, 'sqlstate', None),
+                                getattr(exc, 'pgcode', None))):
                     raise HTTPException(409, 'guide_channel_busy') from None
                 raise
             connection.commit()
@@ -272,13 +305,22 @@ def create_router(current_user, get_connection, hub):
                 connection.commit()
                 row = {**dict(row), 'status': status, 'reason': reason,
                        'light': 'unknown', 'closing': False}
-            if status == 'pending' and row.get('expires_at') and row['expires_at'] < _now():
-                status, reason = 'expired', 'ttl'
-                connection.execute(
-                    '''UPDATE led_guide_request SET status='expired', reason='ttl',
-                            light='unknown', updated_at=NOW() WHERE id=%s''', (request_id,))
-                connection.commit()
-                row = {**dict(row), 'status': status, 'reason': reason, 'light': 'unknown'}
+            expires = row.get('expires_at')
+            if (status in ('pending', 'active') and not row.get('closing')
+                    and isinstance(expires, datetime)):
+                # El nodo apaga solo al vencer su TTL; una fila `active` no
+                # debe reservar el canal indefinidamente (se le da el mismo
+                # margen que a la reserva nueva).
+                grace = 0 if status == 'pending' else RESERVATION_GRACE_SECONDS
+                if expires + timedelta(seconds=grace) < _now():
+                    status, reason = 'expired', 'ttl'
+                    connection.execute(
+                        '''UPDATE led_guide_request SET status='expired', reason='ttl',
+                                light='unknown', closing=FALSE, ended_at=COALESCE(ended_at, NOW()),
+                                updated_at=NOW() WHERE id=%s''', (request_id,))
+                    connection.commit()
+                    row = {**dict(row), 'status': status, 'reason': reason,
+                           'light': 'unknown', 'closing': False}
         _no_store(response)
         return _state(row)
 
