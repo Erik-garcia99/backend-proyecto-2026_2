@@ -71,6 +71,22 @@ class CustomerProductsResponse(BaseModel):
     total_pages: int
 
 
+class CustomerShelfItem(BaseModel):
+    id: str
+    name: str
+    location: str | None = None
+    product_count: int = 0
+    guide_count: int = 0
+
+
+class CustomerShelvesResponse(BaseModel):
+    items: list[CustomerShelfItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
 class CustomerCategoriesResponse(BaseModel):
     categories: list[str]
 

@@ -25,7 +25,8 @@ from .registration_tokens import create_router as token_router, validate_branch_
 from .permissions import require_actor, require_branch_actor, CUSTOMER
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerBranchItem, CustomerBranchesResponse,
                       CustomerCategoriesResponse, CustomerHomeResponse, CustomerProductItem, CustomerProductsResponse,
-                      CustomerRegisterRequest, LoginRequest,
+                      CustomerRegisterRequest, CustomerShelfItem, CustomerShelvesResponse,
+                      LoginRequest,
                       LoginResponse, LogoutRequest, MessageResponse, NotificationPreferences,
                       NotificationPreferencesUpdate, PasswordChangeRequest, PendingUserResponse,
                       ProfileUpdateRequest, RefreshRequest, RefreshResponse,
@@ -588,6 +589,70 @@ def customer_products(branch_id: UUID,
         page_size=page_size,
         total_pages=total_pages
     )
+
+
+@app.get('/customer/branches/{branch_id}/shelves', response_model=CustomerShelvesResponse)
+def customer_shelves(branch_id: UUID,
+                     page: int = Query(1, ge=1),
+                     page_size: int = Query(5, ge=1, le=20),
+                     user=Depends(current_user)):
+    with db.get_connection() as connection:
+        branch = require_branch_actor(connection, branch_id, user, customer=True, staff=True, admin=True)
+        org_id = branch['organization_id']
+
+        total_row = connection.execute(
+            'SELECT COUNT(*) AS total FROM shelf WHERE branch_id=%s AND is_active=TRUE',
+            (branch_id,)).fetchone()
+        total = int(total_row['total']) if total_row else 0
+        total_pages = (total + page_size - 1) // page_size if total > 0 else 1
+        offset = (page - 1) * page_size
+
+        shelf_rows = connection.execute(
+            '''SELECT id, name, location_label FROM shelf
+               WHERE branch_id=%s AND is_active=TRUE
+               ORDER BY name ASC LIMIT %s OFFSET %s''',
+            (branch_id, page_size, offset)).fetchall()
+
+        items = []
+        for sh in shelf_rows:
+            shelf_id = sh['id']
+            prod_row = connection.execute(
+                '''SELECT COUNT(DISTINCT pid) AS c FROM (
+                       SELECT r.product_id AS pid
+                         FROM roi r
+                         JOIN product p ON p.id=r.product_id AND p.is_active
+                        WHERE r.shelf_id=%s AND r.is_active=TRUE AND p.organization_id=%s
+                       UNION
+                       SELECT gpl.product_id AS pid
+                         FROM guide_product_light gpl
+                         JOIN product p ON p.id=gpl.product_id AND p.is_active
+                         JOIN led_guide_point gp ON gp.id=gpl.guide_point_id
+                        WHERE gpl.branch_id=%s AND gp.shelf_id=%s AND p.organization_id=%s
+                   ) t''',
+                (shelf_id, org_id, branch_id, shelf_id, org_id)).fetchone()
+            guide_row = connection.execute(
+                '''SELECT COUNT(DISTINCT gpl.product_id) AS c
+                     FROM guide_product_light gpl
+                     JOIN product p ON p.id=gpl.product_id AND p.is_active
+                     JOIN led_guide_point gp ON gp.id=gpl.guide_point_id
+                    WHERE gpl.branch_id=%s AND gp.shelf_id=%s AND p.organization_id=%s''',
+                (branch_id, shelf_id, org_id)).fetchone()
+
+            items.append(CustomerShelfItem(
+                id=str(shelf_id),
+                name=sh['name'],
+                location=sh.get('location_label'),
+                product_count=int((prod_row or {}).get('c') or 0),
+                guide_count=int((guide_row or {}).get('c') or 0),
+            ))
+
+        return CustomerShelvesResponse(
+            items=items,
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
+        )
 
 
 @app.get('/customer/home', response_model=CustomerHomeResponse)
