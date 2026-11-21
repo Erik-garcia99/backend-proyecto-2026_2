@@ -170,9 +170,10 @@ def load_roi(connection, branch_id: UUID, roi_id: UUID, user):
 
 
 def _reader_context(row: dict) -> dict:
-    return {'camera_node_id': row['camera_node_id'], 'config_version': row['config_version'],
-            'calibration_version': row['calibration_version'],
-            'calibration_status': row['calibration_status']}
+    return {'camera_node_id': row.get('camera_node_id') or row.get('node_id'),
+            'config_version': row.get('config_version'),
+            'calibration_version': row.get('calibration_version'),
+            'calibration_status': row.get('calibration_status')}
 
 
 def default_reader(row: dict) -> RoiOccupancyResponse:
@@ -294,7 +295,7 @@ STATE_ROWS_SQL = '''
     SELECT r.id AS roi_id, r.product_id, r.name AS roi_name, p.sku,
            r.threshold_empty_pct, r.threshold_low_pct, r.threshold_medium_pct,
            r.confirm_samples, r.physical_config_version, r.calibration_status,
-           s.id AS shelf_id, s.name AS shelf_name, s.branch_id,
+           s.id AS shelf_id, s.name AS shelf_name, s.branch_id, s.camera_node_id,
            s.roi_applied_version AS config_version,
            n.id AS node_id, g.id AS gateway_id, c.calibration_version,
            st.status, st.occupancy_pct, st.confidence,

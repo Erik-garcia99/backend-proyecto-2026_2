@@ -112,6 +112,102 @@ class CustomerHomeTests(unittest.TestCase):
         self.assertEqual(body['branch_name'], 'Sucursal Centro')
         self.assertEqual(body['occupancy'], 7)
         self.assertEqual(body['status'], 'ok')
+        self.assertEqual(body['occupancy_level'], 'available')
+
+    def test_customer_home_classifies_near_and_full(self):
+        self.auth_header()
+        connection = FakeConnection(results=[
+            [{'id': BRANCH, 'name': 'Sucursal Centro', 'organization_id': ORG, 'max_capacity_people': 10, 'occupancy_near_pct': 80}],
+            [],
+        ])
+        occ = OccupancyResponse(branch_id=BRANCH, occupancy=8, measured_at=datetime(2026, 11, 12, tzinfo=timezone.utc),
+                                age_seconds=2, stale_after_seconds=20, status='ok')
+        with self.use_connection(connection):
+            with patch.object(main, 'InfluxSettings') as mock_settings:
+                mock_settings.from_env.return_value = object()
+                with patch.object(main, 'replace', side_effect=lambda s, **kw: s):
+                    with patch.object(main, 'read_occupancy', return_value=occ):
+                        response = self.client.get(f'/customer/home?branch_id={BRANCH}', headers={'Authorization': 'Bearer fake'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['occupancy_level'], 'near')
+
+    def test_customer_branches_lists_branches_of_organization(self):
+        self.auth_header()
+        b1 = {'id': BRANCH, 'name': 'Sucursal Norte', 'address': 'Av. Principal 123',
+              'business_category': 'Supermercado', 'max_capacity_people': 50}
+        connection = FakeConnection(results=[
+            {'id': ORG, 'is_active': True},  # check org
+            {'total': 1},                    # count
+            [b1],                            # rows
+        ])
+        with self.use_connection(connection):
+            response = self.client.get('/customer/branches?page=1&page_size=5', headers={'Authorization': 'Bearer fake'})
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['page'], 1)
+        self.assertEqual(data['page_size'], 5)
+        self.assertEqual(len(data['items']), 1)
+        self.assertEqual(data['items'][0]['name'], 'Sucursal Norte')
+
+    def test_customer_branches_rejects_staff_role(self):
+        def current_user():
+            return {'id': USER, 'role': 'employee', 'organization_id': ORG,
+                    'branch_id': BRANCH, 'is_superuser': False}
+        main.app.dependency_overrides[main.current_user] = current_user
+        response = self.client.get('/customer/branches', headers={'Authorization': 'Bearer fake'})
+        self.assertEqual(response.status_code, 403)
+
+    def test_customer_branches_rejects_inactive_organization(self):
+        self.auth_header()
+        connection = FakeConnection(results=[None])  # org not found or inactive
+        with self.use_connection(connection):
+            response = self.client.get('/customer/branches', headers={'Authorization': 'Bearer fake'})
+        self.assertEqual(response.status_code, 403)
+
+    def test_customer_categories_returns_list(self):
+        self.auth_header()
+        connection = FakeConnection(results=[
+            [{'id': BRANCH, 'organization_id': ORG}],  # require_branch_actor
+            [{'name': 'Bebidas'}, {'name': 'Lácteos'}],  # categories
+        ])
+        with self.use_connection(connection):
+            response = self.client.get(f'/customer/branches/{BRANCH}/categories', headers={'Authorization': 'Bearer fake'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['categories'], ['Bebidas', 'Lácteos'])
+
+    def test_customer_products_returns_catalog_with_availability(self):
+        self.auth_header()
+        p1 = {
+            'id': UUID('11111111-1111-4111-8111-111111111111'),
+            'name': 'Leche Entera 1L',
+            'sku': 'LEC-001',
+            'barcode': '7501234567890',
+            'description': 'Leche pasteurizada',
+            'sale_price': 28.50,
+            'category_name': 'Lácteos',
+            'shelf_id': UUID('22222222-2222-4222-8222-222222222222'),
+            'shelf_name': 'Estante A1',
+            'location_label': 'Pasillo 2',
+            'has_guide': True,
+            'roi_status': 'adequate',
+        }
+        connection = FakeConnection(results=[
+            [{'id': BRANCH, 'organization_id': ORG}],  # require_branch_actor
+            {'total': 1},                              # count
+            [p1],                                      # rows
+        ])
+        with self.use_connection(connection):
+            response = self.client.get(f'/customer/branches/{BRANCH}/products?q=Leche', headers={'Authorization': 'Bearer fake'})
+        self.assertEqual(response.status_code, 200, response.text)
+        data = response.json()
+        self.assertEqual(data['total'], 1)
+        item = data['items'][0]
+        self.assertEqual(item['name'], 'Leche Entera 1L')
+        self.assertEqual(item['sale_price'], 28.50)
+        self.assertEqual(item['has_guide'], True)
+        self.assertEqual(item['availability'], 'available')
+        self.assertEqual(item['availability_label'], 'Disponible en repisa')
 
 
 if __name__ == '__main__':
