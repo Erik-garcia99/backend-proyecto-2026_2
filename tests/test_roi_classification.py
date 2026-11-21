@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.roi_classification import (Thresholds, candidate_status, classify_step,
-                                    create_router)
+                                    create_router, scan_branch_states)
 from app.telemetry import RoiOccupancyResponse
 
 B = UUID('11111111-1111-4111-8111-111111111111')
@@ -200,6 +200,26 @@ class ApiTests(unittest.TestCase):
     def test_forbidden_user_is_403(self):
         self.user = {**self.user, 'role': 'employee', 'organization_id': UUID(int=9)}
         self.assertEqual(self.client.get(self.state_path).status_code, 403)
+
+
+class BranchScanTests(unittest.TestCase):
+    def test_inactive_branch_is_skipped_without_http_error(self):
+        class InactiveConnection(FakeConnection):
+            def execute(self, sql, args=()):
+                if 'SELECT b.id, b.organization_id FROM branch b' in sql:
+                    result = Mock()
+                    result.fetchone.return_value = None
+                    return result
+                return super().execute(sql, args)
+
+        connection = InactiveConnection()
+
+        @contextmanager
+        def connect():
+            yield connection
+
+        self.assertEqual(scan_branch_states(connect, B), 0)
+        self.assertFalse(connection.committed)
 
 
 if __name__ == '__main__':

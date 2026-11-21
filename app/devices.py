@@ -137,6 +137,25 @@ def require_branch(connection, branch_id: UUID, user):
     return branch
 
 
+def require_configured_shelf_products(connection, branch_id: UUID, shelf_id: UUID):
+    """Antes de enlazar una cámara, exige orientación y medidas de los productos de la repisa."""
+    rows = connection.execute(
+        '''SELECT p.name, p.sku,
+                  spec.config_version > 0 AND spec.width_mm IS NOT NULL
+                      AND spec.height_mm IS NOT NULL AND spec.depth_mm IS NOT NULL
+                      AND spec.usual_orientation IS NOT NULL AS ready
+             FROM shelf_product sp
+             JOIN product p ON p.id=sp.product_id AND p.is_active
+             LEFT JOIN product_physical_spec spec ON spec.product_id=p.id
+            WHERE sp.shelf_id=%s AND sp.branch_id=%s
+            ORDER BY p.name''',
+        (shelf_id, branch_id)).fetchall()
+    missing = [row for row in rows if not row['ready']]
+    if missing:
+        names = ', '.join(f"{row['name']} ({row['sku']})" for row in missing[:3])
+        raise HTTPException(409, 'Configura primero la orientación y las medidas físicas de: ' + names)
+
+
 def load_node(connection, branch_id: UUID, device_id: UUID, *, node_type=None, lock=False, candidate=False):
     query = '''SELECT n.*, g.branch_id AS gateway_branch_id, g.rpi_identifier,
                       g.display_name AS gateway_name
@@ -568,6 +587,7 @@ def create_router(current_user, get_connection, hub):
                 (body.shelf_id, branch_id)).fetchone()
             if not shelf:
                 raise HTTPException(404, 'Estante no encontrado en esta sucursal')
+            require_configured_shelf_products(connection, branch_id, body.shelf_id)
             current = connection.execute(
                 '''SELECT id, name FROM shelf
                    WHERE camera_node_id=%s AND branch_id=%s AND id<>%s''',

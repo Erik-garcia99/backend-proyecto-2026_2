@@ -256,6 +256,8 @@ class ShelfTests(CatalogBase):
                 return result(row=shelf_row(camera_node_id=DEVICE))
             if 'FROM roi_calibration_session' in sql:
                 return result(row=None)
+            if 'FROM shelf_product sp' in sql:
+                return result(rows=[])
             raise AssertionError(sql)
 
         connection = FakeConnection(handler)
@@ -275,6 +277,8 @@ class ShelfTests(CatalogBase):
                 return result(row=None)
             if 'FROM roi_calibration_session' in sql:
                 return result(row=None)
+            if 'FROM shelf_product sp' in sql:
+                return result(rows=[])
             raise AssertionError(sql)
 
         connection = FakeConnection(handler)
@@ -294,6 +298,8 @@ class ShelfTests(CatalogBase):
                 return result(row={'id': SHELF, 'name': 'Repisa actual'})
             if 'FROM roi_calibration_session' in sql:
                 return result(row=None)
+            if 'FROM shelf_product sp' in sql:
+                return result(rows=[])
             raise AssertionError(sql)
 
         connection = FakeConnection(handler)
