@@ -317,8 +317,16 @@ STATE_ROWS_SQL = '''
 def scan_branch_states(get_connection, branch_id: UUID, reader: RoiReader | None = None):
     """Clasifica todas las ROI activas de una sucursal. Lo usará el monitor del paso 2."""
     with get_connection() as connection:
-        require_branch(connection, branch_id, {'is_superuser': True, 'role': 'sudo',
-                                               'organization_id': None, 'branch_id': branch_id})
+        # Monitor interno: una sucursal dada de baja no debe lanzar HTTPException
+        # ni detener el escaneo del resto de sucursales.
+        branch = connection.execute(
+            '''SELECT b.id, b.organization_id FROM branch b
+               JOIN organization o ON o.id=b.organization_id
+               WHERE b.id=%s AND b.is_active AND o.is_active''',
+            (branch_id,)).fetchone()
+        if not branch:
+            log.info('Sucursal %s inactiva; se omite el escaneo de estados visuales', branch_id)
+            return 0
         rows = connection.execute(STATE_ROWS_SQL, (branch_id,)).fetchall()
         for row in rows:
             context = {**_reader_context(row), 'branch_id': str(branch_id), 'roi_id': str(row['roi_id'])}

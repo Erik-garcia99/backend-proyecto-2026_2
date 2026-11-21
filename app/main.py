@@ -36,6 +36,9 @@ from .security import (create_access_token, decode_access_token, hash_password,
                        hash_registration_token, verify_password, generate_registration_token,
                        generate_refresh_token, hash_refresh_token, needs_rehash)
 
+# Roles con alcance de toda la organización (coherente con require_branch_access).
+ORG_WIDE_ROLES = frozenset({'owner', 'gerencia'})
+
 gateway_hub = GatewayHub(db.get_connection,
     validate_token=lambda branch_id, digest: validate_branch_token(db.get_connection, branch_id, digest))
 
@@ -405,6 +408,9 @@ app.include_router(guide_gateway_router(db.get_connection))
 app.include_router(rois_router(current_user, db.get_connection, gateway_hub))
 app.include_router(calibrations_router(current_user, db.get_connection, gateway_hub))
 app.include_router(telemetry_router(current_user, db.get_connection))
+app.include_router(physical_config_router(current_user, db.get_connection))
+app.include_router(roi_classification_router(current_user, db.get_connection))
+app.include_router(pos_router(current_user, db.get_connection))
 
 def classify_occupancy(occupancy: int | None, status: str, max_capacity: int | None, near_pct: float = 80.0) -> str:
     if occupancy is None or status != 'ok':

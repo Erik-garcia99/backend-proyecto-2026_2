@@ -91,26 +91,32 @@ def scan_visual_states(get_connection, reader=None):
     with get_connection() as connection:
         branches = connection.execute(
             """SELECT DISTINCT s.branch_id FROM roi r JOIN shelf s ON s.id=r.shelf_id
+               JOIN branch b ON b.id=s.branch_id AND b.is_active
+               JOIN organization o ON o.id=b.organization_id AND o.is_active
                WHERE r.is_active AND s.is_active""").fetchall()
     for branch in branches:
         branch_id = branch['branch_id']
-        scan_branch_states(get_connection, branch_id, reader)
-        with get_connection() as connection:
-            rows = connection.execute(STATE_ROWS_SQL, (branch_id,)).fetchall()
-            for row in rows:
-                last = row.get('last_reading_at')
-                age = max(0, int((datetime.now(timezone.utc) - last).total_seconds())) if last else None
-                if row['calibration_status'] != 'calibrated':
-                    quality = 'not_calibrated'
-                elif age is None:
-                    quality = 'no_data'
-                elif age >= 60:
-                    quality = 'stale'
-                else:
-                    quality = 'ok'
-                visual_episode(connection, row={**row, 'branch_id': branch_id},
-                               quality=quality, status=row.get('status'))
-            connection.commit()
+        try:
+            scan_branch_states(get_connection, branch_id, reader)
+            with get_connection() as connection:
+                rows = connection.execute(STATE_ROWS_SQL, (branch_id,)).fetchall()
+                for row in rows:
+                    last = row.get('last_reading_at')
+                    age = max(0, int((datetime.now(timezone.utc) - last).total_seconds())) if last else None
+                    if row['calibration_status'] != 'calibrated':
+                        quality = 'not_calibrated'
+                    elif age is None:
+                        quality = 'no_data'
+                    elif age >= 60:
+                        quality = 'stale'
+                    else:
+                        quality = 'ok'
+                    visual_episode(connection, row={**row, 'branch_id': branch_id},
+                                   quality=quality, status=row.get('status'))
+                connection.commit()
+        except Exception:
+            # Un fallo en una sucursal no debe impedir evaluar las demás.
+            log.exception('No se pudo evaluar el estado visual de la sucursal %s', branch_id)
     return len(branches)
 
 
