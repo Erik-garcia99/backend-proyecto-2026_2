@@ -29,6 +29,7 @@ class CustomerRegisterRequest(BaseModel):
     last_name: str = Field(min_length=1, max_length=100)
     phone: str | None = Field(default=None, max_length=30)
     organization_slug: str | None = Field(default=None, max_length=100)
+    organization_code: str | None = Field(default=None, max_length=50)
 
 
 class CustomerBranchItem(BaseModel):

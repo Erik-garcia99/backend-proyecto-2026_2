@@ -22,7 +22,7 @@ from .pos import PosError, create_router as pos_router, error_response as pos_er
 from .node_registration import make_router as node_router
 from .telemetry import (create_router as telemetry_router, read_occupancy, InfluxSettings, replace)
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
-from .permissions import require_actor, require_branch_actor, CUSTOMER
+from .permissions import require_actor, require_branch_actor, CUSTOMER, is_superuser, role
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerBranchItem, CustomerBranchesResponse,
                       CustomerCategoriesResponse, CustomerHomeResponse, CustomerProductItem, CustomerProductsResponse,
                       CustomerRegisterRequest, CustomerShelfItem, CustomerShelvesResponse,
@@ -81,13 +81,19 @@ def user_response(user):
         role=user['role'], organization_id=str(user['organization_id']),
         branch_id=str(user['branch_id']) if user['branch_id'] else None)
 
-def customer_organization(connection, requested_slug):
+def customer_organization(connection, requested_slug, requested_code=None):
     """Resuelve la organización del cliente sin atarlo a una sucursal.
 
-    Orden: slug enviado por el cliente -> CUSTOMER_ORGANIZATION_SLUG -> única
-    organización activa. Con varias organizaciones y sin slug, se rechaza para
-    no registrar al cliente en la tienda equivocada.
+    Orden: código de organización del cliente -> slug enviado -> CUSTOMER_ORGANIZATION_SLUG
+    -> única organización activa. Con varias organizaciones y sin código/slug, se rechaza.
     """
+    code = (requested_code or '').strip()
+    if code:
+        row = connection.execute(
+            'SELECT id FROM organization WHERE customer_code=%s AND is_active', (code,)).fetchone()
+        if not row:
+            raise HTTPException(400, 'El código de organización no existe o está inactivo')
+        return row['id']
     slug = (requested_slug or CUSTOMER_ORGANIZATION_SLUG or '').strip()
     if slug:
         row = connection.execute('SELECT id FROM organization WHERE slug=%s AND is_active', (slug,)).fetchone()
@@ -99,7 +105,7 @@ def customer_organization(connection, requested_slug):
         return rows[0]['id']
     if not rows:
         raise HTTPException(503, 'No hay una organización activa para registrar clientes')
-    raise HTTPException(400, 'El registro de clientes requiere indicar organization_slug')
+    raise HTTPException(400, 'El registro de clientes requiere indicar organization_code u organization_slug')
 
 @app.get('/health')
 def health():
@@ -141,7 +147,7 @@ def customer_register(request: CustomerRegisterRequest):
     después), pero `branch_id` se guarda NULL: no pertenece a una tienda.
     """
     with db.get_connection() as connection:
-        organization_id = customer_organization(connection, request.organization_slug)
+        organization_id = customer_organization(connection, request.organization_slug, request.organization_code)
         try:
             user = connection.execute('''INSERT INTO "user" (organization_id,branch_id,email,first_name,last_name,
                 phone_number,password_hash,role,account_status)
@@ -269,7 +275,28 @@ def change_password(request:PasswordChangeRequest,user=Depends(current_user)):
         connection.commit()
     return MessageResponse(message='Contraseña actualizada')
 
-ORG_WIDE_ROLES = {'owner', 'gerencia'}
+@app.post('/organizations/{organization_id}/customer-code', response_model=MessageResponse)
+def set_customer_code(organization_id: UUID, user=Depends(current_user)):
+    """Genera/asigna un código simple de organización para registro de clientes.
+
+    Solo owner/admin de la organización (o SUDO) pueden hacerlo.
+    """
+    if not (is_superuser(user) or (role(user) == 'owner' and str(user.get('organization_id')) == str(organization_id))):
+        raise HTTPException(403, 'No tienes permisos para esta acción')
+    code = 'ORG-' + uuid4().hex[:6].upper()
+    with db.get_connection() as connection:
+        org = connection.execute('SELECT id FROM organization WHERE id=%s AND is_active', (organization_id,)).fetchone()
+        if not org:
+            raise HTTPException(404, 'Organización no encontrada o inactiva')
+        # Ensure uniqueness (retry a few times just in case)
+        for _ in range(5):
+            exists = connection.execute('SELECT 1 FROM organization WHERE customer_code=%s', (code,)).fetchone()
+            if not exists:
+                break
+            code = 'ORG-' + uuid4().hex[:6].upper()
+        connection.execute('UPDATE organization SET customer_code=%s WHERE id=%s', (code, organization_id))
+        connection.commit()
+    return MessageResponse(message=f'Código de organización generado: {code}')
 
 @app.get('/auth/pending', response_model=list[PendingUserResponse])
 def pending_users(user=Depends(current_user)):
