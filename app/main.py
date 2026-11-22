@@ -180,22 +180,29 @@ def login(request: LoginRequest):
             connection.execute('UPDATE "user" SET password_hash=%s, updated_at=NOW() WHERE id=%s',
                 (new_hash, user['id']))
             connection.commit()
-    # Crear sesión con refresh token (D-C3).
+    # Crear sesión con refresh token (D-C3). El id de sesión viaja en el access
+    # token (`sid`) para poder revocarlo efectivamente al cerrar sesión.
     refresh_token = generate_refresh_token()
+    session_id = uuid4()
     expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
     with db.get_connection() as connection:
-        connection.execute('''INSERT INTO auth_session (user_id, refresh_token_hash, platform,
-            device_label, expires_at) VALUES (%s, %s, %s, %s, %s)''',
-            (user['id'], hash_refresh_token(refresh_token), None, None, expires_at))
+        connection.execute('''INSERT INTO auth_session (id, user_id, refresh_token_hash, platform,
+            device_label, expires_at) VALUES (%s, %s, %s, %s, %s, %s)''',
+            (session_id, user['id'], hash_refresh_token(refresh_token), None, None, expires_at))
         connection.commit()
-    return LoginResponse(access_token=create_access_token(str(user['id'])),
+    return LoginResponse(access_token=create_access_token(str(user['id']), session_id),
                          refresh_token=refresh_token,
                          expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
                          user=user_response(user))
 
 @app.post('/auth/refresh', response_model=RefreshResponse)
 def refresh(request: RefreshRequest):
-    """Emite un nuevo access_token si el refresh_token es válido y no revocado."""
+    """Rota la sesión: revoca la anterior y emite access + refresh nuevos.
+
+    El refresh anterior deja de ser válido (su sesión queda revocada) y el
+    access token antiguo también, porque el nuevo access token apunta a otra
+    sesión y `current_user` valida el `sid`.
+    """
     digest = hash_refresh_token(request.refresh_token)
     with db.get_connection() as connection:
         session = connection.execute('''SELECT s.id, s.user_id, s.expires_at, s.revoked_at
@@ -211,14 +218,37 @@ def refresh(request: RefreshRequest):
         if not user:
             raise HTTPException(403, 'La cuenta no está activa')
         connection.execute('UPDATE auth_session SET last_used_at=NOW() WHERE id=%s', (session['id'],))
+        new_refresh = generate_refresh_token()
+        new_session_id = uuid4()
+        new_expires = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        connection.execute('UPDATE auth_session SET revoked_at=NOW() WHERE id=%s', (session['id'],))
+        connection.execute('''INSERT INTO auth_session (id, user_id, refresh_token_hash, platform,
+            device_label, expires_at, last_used_at) VALUES (%s, %s, %s, %s, %s, %s, NOW())''',
+            (new_session_id, session['user_id'], hash_refresh_token(new_refresh), None, None, new_expires))
         connection.commit()
-    return RefreshResponse(access_token=create_access_token(str(user['id'])),
+    return RefreshResponse(access_token=create_access_token(str(user['id']), new_session_id),
+                           refresh_token=new_refresh,
                            expires_in=ACCESS_TOKEN_EXPIRE_MINUTES * 60)
 
 def current_user(credentials: HTTPAuthorizationCredentials=Depends(bearer)):
     if not credentials:raise HTTPException(401,'Se requiere un token Bearer')
-    try: user_id=UUID(decode_access_token(credentials.credentials)['sub'])
+    try:
+        payload = decode_access_token(credentials.credentials)
+        user_id = UUID(payload['sub'])
     except (jwt.InvalidTokenError,KeyError,ValueError):raise HTTPException(401,'Token inválido o expirado')
+    # Los tokens emitidos antes de la rotación no traen `sid` y siguen
+    # funcionando hasta expirar. Los nuevos se comprueban contra auth_session:
+    # logout o una rotación los invalidan de inmediato (SEC-14).
+    session_id = payload.get('sid')
+    if session_id:
+        try: session_uuid = UUID(str(session_id))
+        except (ValueError, TypeError, AttributeError): raise HTTPException(401,'Token inválido o expirado')
+        with db.get_connection() as connection:
+            active_session = connection.execute('''SELECT id FROM auth_session
+                WHERE id=%s AND user_id=%s AND revoked_at IS NULL AND expires_at >= NOW()''',
+                (session_uuid, user_id)).fetchone()
+        if not active_session:
+            raise HTTPException(401,'La sesión fue cerrada. Inicia sesión de nuevo.')
     with db.get_connection() as connection:
         user=connection.execute('SELECT *, (lower(role)=\'sudo\') AS is_superuser FROM "user" WHERE id=%s AND deactivated_at IS NULL',(user_id,)).fetchone()
     if not user or user['account_status']!='active':raise HTTPException(403,'La cuenta no está activa')
