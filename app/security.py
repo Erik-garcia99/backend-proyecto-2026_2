@@ -56,13 +56,20 @@ def hash_refresh_token(token: str) -> str:
     return token_hash(token)
 
 
-def create_access_token(user_id: str) -> str:
+def create_access_token(user_id: str, session_id=None) -> str:
+    """Access token. Con session_id incluye `sid` para poder revocar la sesión.
+
+    El argumento es opcional para no romper tokens emitidos/creados antes de
+    este cambio (por ejemplo, en pruebas y herramientas de diagnóstico).
+    """
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user_id,
         "iat": now,
         "exp": now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     }
+    if session_id is not None:
+        payload["sid"] = str(session_id)
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
