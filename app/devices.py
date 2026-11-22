@@ -150,6 +150,8 @@ def require_configured_shelf_products(connection, branch_id: UUID, shelf_id: UUI
             WHERE sp.shelf_id=%s AND sp.branch_id=%s
             ORDER BY p.name''',
         (shelf_id, branch_id)).fetchall()
+    if not rows:
+        raise HTTPException(409, 'La repisa no tiene productos; agrega y configura al menos uno antes de vincular la cámara')
     missing = [row for row in rows if not row['ready']]
     if missing:
         names = ', '.join(f"{row['name']} ({row['sku']})" for row in missing[:3])
@@ -471,13 +473,32 @@ def create_router(current_user, get_connection, hub):
     @router.get('/branches/{branch_id}/shelves')
     def list_shelves(branch_id: UUID, response: Response, user=Depends(current_user)):
         with get_connection() as connection:
-            require_branch(connection, branch_id, user)
+            # Lectura de staff: el empleado puede consultar repisas y luces;
+            # la edición sigue limitada a admin en los endpoints de escritura.
+            require_branch_actor(connection, branch_id, user, admin=True, staff=True)
             rows = connection.execute(
-                '''SELECT id, name, location_label FROM shelf
-                   WHERE branch_id=%s AND is_active ORDER BY name''',
+                '''SELECT s.id, s.name, s.location_label, s.camera_node_id,
+                          cam.name AS camera_name,
+                          (SELECT COUNT(*) FROM shelf_product sp
+                             JOIN product p ON p.id=sp.product_id
+                            WHERE sp.shelf_id=s.id) AS product_count,
+                          (SELECT COUNT(*) FROM led_guide_point gp
+                            WHERE gp.shelf_id=s.id) AS light_count,
+                          (SELECT COUNT(DISTINCT gp.node_id) FROM led_guide_point gp
+                            WHERE gp.shelf_id=s.id) AS guide_node_count
+                     FROM shelf s
+                     LEFT JOIN esp32_node cam ON cam.id=s.camera_node_id
+                    WHERE s.branch_id=%s AND s.is_active
+                    ORDER BY s.name''',
                 (branch_id,)).fetchall()
         response.headers['Cache-Control'] = 'no-store'
-        return [{'id': str(row['id']), 'name': row['name'], 'location': row['location_label']}
+        return [{'id': str(row['id']), 'name': row['name'],
+                 'location': row['location_label'],
+                 'cameraNodeId': str(row['camera_node_id']) if row.get('camera_node_id') else None,
+                 'cameraName': row.get('camera_name'),
+                 'productCount': int(row.get('product_count') or 0),
+                 'lightCount': int(row.get('light_count') or 0),
+                 'guideNodeCount': int(row.get('guide_node_count') or 0)}
                 for row in rows]
 
     def shelf_in_branch(connection, branch_id, shelf_id):
@@ -490,14 +511,15 @@ def create_router(current_user, get_connection, hub):
 
     # --- Fase 3: catálogo mínimo de productos y vínculo cámara-repisa ---
 
-    @router.get('/branches/{branch_id}/shelves/{shelf_id}/products')
-    def list_shelf_products(branch_id: UUID, shelf_id: UUID, response: Response,
-                            user=Depends(current_user)):
+    @router.get('/branches/{branch_id}/shelves/{shelf_id}/guide-products')
+    def list_shelf_guide_products(branch_id: UUID, shelf_id: UUID, response: Response,
+                                  user=Depends(current_user)):
         with get_connection() as connection:
             branch = require_branch(connection, branch_id, user)
             shelf_in_branch(connection, branch_id, shelf_id)
-            # Ubicación propia de la guía. Una zona de cámara no asigna un LED
-            # ni es requisito para configurarlo o encenderlo.
+            # Productos ya asociados a los LED de esta repisa (dominio de la guía).
+            # No es la configuración `shelf_product`: esa vive en
+            # `GET /shelves/{shelf_id}/products` (app/shelf_products.py).
             rows = connection.execute(
                 '''SELECT p.id, p.sku, p.name, p.is_active FROM product p
                     WHERE p.organization_id=%s AND p.is_active AND EXISTS (

@@ -107,7 +107,7 @@ class ProductTests(CatalogBase):
             return result(rows=[product_row()])
 
         response = self.client(FakeConnection(handler)).get(
-            f'/branches/{BRANCH}/shelves/{SHELF}/products')
+            f'/branches/{BRANCH}/shelves/{SHELF}/guide-products')
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()[0]['name'], 'Leche entera')
         self.assertEqual(response.headers['cache-control'], 'no-store')
@@ -119,16 +119,34 @@ class ProductTests(CatalogBase):
             return result(rows=[])
 
         response = self.client(FakeConnection(handler)).get(
-            f'/branches/{BRANCH}/shelves/{SHELF}/products')
+            f'/branches/{BRANCH}/shelves/{SHELF}/guide-products')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), [])
 
     def test_shelf_products_reject_unknown_or_other_branch_shelf(self):
         connection = FakeConnection(lambda sql, params: result(row=None))
         response = self.client(connection).get(
-            f'/branches/{BRANCH}/shelves/{SHELF}/products')
+            f'/branches/{BRANCH}/shelves/{SHELF}/guide-products')
         self.assertEqual(response.status_code, 404)
         self.assertEqual(len(connection.calls), 1)
+
+    def test_shelf_list_includes_counts_and_camera(self):
+        row = {
+            'id': SHELF, 'name': 'Repisa 1', 'location_label': 'Piso 1',
+            'camera_node_id': DEVICE, 'camera_name': 'CAM-1',
+            'product_count': 2, 'light_count': 3, 'guide_node_count': 1,
+        }
+        connection = FakeConnection(lambda sql, params: result(rows=[row]))
+        with patch.object(devices, 'require_branch_actor',
+                          return_value={'id': BRANCH, 'organization_id': ORG}):
+            response = self.client(connection).get(f'/branches/{BRANCH}/shelves')
+        self.assertEqual(response.status_code, 200, response.text)
+        shelf = response.json()[0]
+        self.assertEqual(shelf['cameraName'], 'CAM-1')
+        self.assertEqual(shelf['cameraNodeId'], str(DEVICE))
+        self.assertEqual(shelf['productCount'], 2)
+        self.assertEqual(shelf['lightCount'], 3)
+        self.assertEqual(shelf['guideNodeCount'], 1)
 
     def test_lists_active_products_of_the_organization_with_search(self):
         connection = FakeConnection(lambda sql, params: result(rows=[product_row()]))
@@ -257,7 +275,7 @@ class ShelfTests(CatalogBase):
             if 'FROM roi_calibration_session' in sql:
                 return result(row=None)
             if 'FROM shelf_product sp' in sql:
-                return result(rows=[])
+                return result(rows=[{'name': 'Leche', 'sku': 'SKU-1', 'ready': True}])
             raise AssertionError(sql)
 
         connection = FakeConnection(handler)
@@ -278,7 +296,7 @@ class ShelfTests(CatalogBase):
             if 'FROM roi_calibration_session' in sql:
                 return result(row=None)
             if 'FROM shelf_product sp' in sql:
-                return result(rows=[])
+                return result(rows=[{'name': 'Leche', 'sku': 'SKU-1', 'ready': True}])
             raise AssertionError(sql)
 
         connection = FakeConnection(handler)
@@ -299,7 +317,7 @@ class ShelfTests(CatalogBase):
             if 'FROM roi_calibration_session' in sql:
                 return result(row=None)
             if 'FROM shelf_product sp' in sql:
-                return result(rows=[])
+                return result(rows=[{'name': 'Leche', 'sku': 'SKU-1', 'ready': True}])
             raise AssertionError(sql)
 
         connection = FakeConnection(handler)
