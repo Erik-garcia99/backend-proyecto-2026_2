@@ -149,7 +149,8 @@ class ProductTests(CatalogBase):
         self.assertEqual(shelf['guideNodeCount'], 1)
 
     def test_lists_active_products_of_the_organization_with_search(self):
-        connection = FakeConnection(lambda sql, params: result(rows=[product_row()]))
+        connection = FakeConnection(
+            lambda sql, params: result(rows=[product_row(physical_configured=False)]))
         response = self.client(connection).get(
             f'/branches/{BRANCH}/products?search= leche &limit=5')
 
@@ -159,9 +160,20 @@ class ProductTests(CatalogBase):
             'sku': 'SKU-1',
             'name': 'Leche entera',
             'active': True,
+            'physicalConfigured': False,
         }])
         _, params = connection.calls[-1]
         self.assertEqual(params, (ORG, '%leche%', '%leche%', '%leche%', 5))
+
+    def test_catalogo_indica_si_el_producto_ya_tiene_medidas(self):
+        rows = [product_row(physical_configured=True), product_row(physical_configured=False)]
+        connection = FakeConnection(lambda sql, params: result(rows=rows))
+        response = self.client(connection).get(f'/branches/{BRANCH}/products')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item['physicalConfigured'] for item in response.json()], [True, False])
+        query = connection.calls[-1][0]
+        self.assertIn('product_physical_spec', query, 'El catálogo debe consultar las medidas guardadas')
 
     def test_blank_search_does_not_filter(self):
         connection = FakeConnection(lambda sql, params: result(rows=[]))

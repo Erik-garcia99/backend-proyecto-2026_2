@@ -238,12 +238,17 @@ def serialize_light(row):
 
 
 def serialize_product(row):
-    return {
+    product = {
         'id': str(row['id']),
         'sku': row['sku'],
         'name': row['name'],
         'active': row['is_active'],
     }
+    # Solo el catálogo consulta la configuración física del producto. Si la
+    # consulta no la trae, no se inventa un valor.
+    if 'physical_configured' in row:
+        product['physicalConfigured'] = bool(row['physical_configured'])
+    return product
 
 
 def serialize_shelf(row):
@@ -541,10 +546,18 @@ def create_router(current_user, get_connection, hub):
             term = (search or '').strip()
             pattern = f'%{term}%' if term else None
             rows = connection.execute(
-                '''SELECT id, sku, name, is_active FROM product
-                   WHERE organization_id=%s AND is_active
-                     AND (%s::text IS NULL OR sku ILIKE %s OR name ILIKE %s)
-                   ORDER BY name, sku LIMIT %s''',
+                '''SELECT p.id, p.sku, p.name, p.is_active,
+                          CASE WHEN spec.config_version > 0
+                                    AND spec.width_mm IS NOT NULL
+                                    AND spec.height_mm IS NOT NULL
+                                    AND spec.depth_mm IS NOT NULL
+                                    AND spec.usual_orientation IS NOT NULL
+                               THEN TRUE ELSE FALSE END AS physical_configured
+                     FROM product p
+                     LEFT JOIN product_physical_spec spec ON spec.product_id=p.id
+                    WHERE p.organization_id=%s AND p.is_active
+                      AND (%s::text IS NULL OR p.sku ILIKE %s OR p.name ILIKE %s)
+                    ORDER BY p.name, p.sku LIMIT %s''',
                 (branch['organization_id'], pattern, pattern, pattern, limit)).fetchall()
         response.headers['Cache-Control'] = 'no-store'
         return [serialize_product(row) for row in rows]
