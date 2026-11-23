@@ -25,6 +25,7 @@ from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field
 
 from .registration_tokens import require_branch_access
+from .logs import record_change
 from .permissions import require_branch_actor
 
 LIGHT_LIMIT = 8
@@ -414,6 +415,10 @@ def create_router(current_user, get_connection, hub):
                 '''UPDATE esp32_node SET name=%s, location=%s, updated_at=NOW()
                    WHERE id=%s RETURNING *''',
                 (body.name, body.location, device_id)).fetchone()
+            record_change(connection, branch_id, user, 'device.updated',
+                          node_id=device_id,
+                          before={'name': node.get('name'), 'location': node.get('location')},
+                          after={'name': updated.get('name'), 'location': updated.get('location')})
             connection.commit()
             updated = {**updated, 'rpi_identifier': node['rpi_identifier']}
         response.headers['Cache-Control'] = 'no-store'
@@ -636,6 +641,10 @@ def create_router(current_user, get_connection, hub):
                    SET camera_node_id=%s, camera_node_type='shelf_cam', updated_at=NOW()
                    WHERE id=%s RETURNING *''',
                 (device_id, body.shelf_id)).fetchone()
+            record_change(connection, branch_id, user, 'camera.linked',
+                          node_id=device_id,
+                          before={'shelfId': str(body.shelf_id), 'cameraNodeId': None},
+                          after={'shelfId': str(body.shelf_id), 'cameraNodeId': str(device_id)})
             connection.commit()
         response.headers['Cache-Control'] = 'no-store'
         return serialize_shelf(updated)
@@ -716,6 +725,10 @@ def create_router(current_user, get_connection, hub):
                     '''INSERT INTO led_guide_point(node_id, node_type, shelf_id, led_index, name)
                        VALUES(%s, 'guide', %s, %s, %s) RETURNING *''',
                     (device_id, body.shelf_id, body.channel, body.name)).fetchone()
+                record_change(connection, branch_id, user, 'light.added',
+                              node_id=device_id, before=None,
+                              after={'lightId': str(light['id']), 'channel': body.channel,
+                                     'shelfId': str(body.shelf_id), 'name': body.name})
                 connection.commit()
             except UniqueViolation:
                 connection.rollback()
@@ -748,6 +761,12 @@ def create_router(current_user, get_connection, hub):
                     '''UPDATE led_guide_point SET name=%s, shelf_id=%s
                        WHERE id=%s RETURNING *''',
                     (body.name, body.shelf_id, light_id)).fetchone()
+                record_change(connection, branch_id, user, 'light.updated',
+                              node_id=device_id,
+                              before={'lightId': str(light_id), 'name': light.get('name'),
+                                      'shelfId': str(light['shelf_id'])},
+                              after={'lightId': str(light_id), 'name': updated.get('name'),
+                                     'shelfId': str(body.shelf_id)})
                 connection.commit()
             except UniqueViolation:
                 connection.rollback()
@@ -783,6 +802,14 @@ def create_router(current_user, get_connection, hub):
         data = result.get('data')
         if not isinstance(data, dict) or data.get('status') not in ('applied', 'rejected', 'unknown'):
             raise HTTPException(502, 'El gateway no devolvió un resultado válido de la prueba')
+        with get_connection() as connection:
+            record_change(connection, branch_id, user, 'light.tested',
+                          node_id=device_id, before=None,
+                          after={'channel': body.channel,
+                                 'durationSeconds': body.duration_seconds,
+                                 'status': data.get('status'), 'light': data.get('light')},
+                          message='Prueba de luz solicitada')
+            connection.commit()
         response.headers['Cache-Control'] = 'no-store'
         return data
 

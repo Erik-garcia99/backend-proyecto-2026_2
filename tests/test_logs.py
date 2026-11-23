@@ -1,5 +1,6 @@
 import json
 import unittest
+from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from uuid import UUID
@@ -49,6 +50,18 @@ class _Result:
 
     def fetchall(self):
         return self._rows
+
+
+class LedAuditWiringTests(unittest.TestCase):
+    def test_led_actions_write_history(self):
+        root = Path(__file__).resolve().parents[1] / 'app'
+        devices = (root / 'devices.py').read_text(encoding='utf-8')
+        guide = (root / 'guide.py').read_text(encoding='utf-8')
+        for event in ('device.updated', 'light.added', 'light.updated',
+                      'light.tested', 'camera.linked'):
+            self.assertIn(f"'{event}'", devices, f'Falta auditar {event}')
+        for event in ('guide.product_assigned', 'guide.product_unassigned'):
+            self.assertIn(f"'{event}'", guide, f'Falta auditar {event}')
 
 
 class RecordChangeTests(unittest.TestCase):

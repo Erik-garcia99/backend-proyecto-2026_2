@@ -288,6 +288,8 @@ class ShelfTests(CatalogBase):
                 return result(row=None)
             if 'FROM shelf_product sp' in sql:
                 return result(rows=[{'name': 'Leche', 'sku': 'SKU-1', 'ready': True}])
+            if 'INSERT INTO system_log' in sql:
+                return result(row=None)
             raise AssertionError(sql)
 
         connection = FakeConnection(handler)
