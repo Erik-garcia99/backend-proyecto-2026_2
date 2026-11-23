@@ -11,6 +11,7 @@ from psycopg.errors import UniqueViolation
 from . import db
 from .shelf_products import create_router as shelf_products_router
 from .physical_config import create_router as physical_config_router
+from .logs import create_router as logs_router
 from .roi_classification import create_router as roi_classification_router
 from .alerts import create_router as alerts_router, monitor as alerts_monitor
 from .visual_alerts import monitor as visual_alerts_monitor
@@ -441,6 +442,7 @@ app.include_router(calibrations_router(current_user, db.get_connection, gateway_
 app.include_router(telemetry_router(current_user, db.get_connection))
 app.include_router(shelf_products_router(current_user, db.get_connection))
 app.include_router(physical_config_router(current_user, db.get_connection))
+app.include_router(logs_router(current_user, db.get_connection))
 app.include_router(roi_classification_router(current_user, db.get_connection))
 app.include_router(pos_router(current_user, db.get_connection))
 

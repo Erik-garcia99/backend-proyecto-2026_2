@@ -12,6 +12,7 @@ from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field
 
 from .devices import ShelfCreate
+from .logs import record_change
 from .permissions import require_branch_actor
 
 log = logging.getLogger(__name__)
@@ -63,6 +64,9 @@ def create_router(current_user, get_connection):
                    VALUES(%s,%s,%s)
                    RETURNING id, name, location_label, camera_node_id, is_active''',
                 (branch_id, body.name, body.location_label)).fetchone()
+            record_change(connection, branch_id, user, 'shelf.created',
+                          before=None, after={'id': str(row['id']), 'name': row['name'],
+                                              'location': row['location_label']})
             connection.commit()
         response.headers['Cache-Control'] = 'no-store'
         return _shelf(row)
@@ -114,7 +118,7 @@ def create_router(current_user, get_connection):
         with get_connection() as connection:
             require_branch_actor(connection, branch_id, user, admin=True)
             row = connection.execute(
-                'SELECT id FROM shelf WHERE id=%s AND branch_id=%s AND is_active',
+                'SELECT id,name,location_label FROM shelf WHERE id=%s AND branch_id=%s AND is_active',
                 (shelf_id, branch_id)).fetchone()
             if not row:
                 raise HTTPException(404, 'Repisa no encontrada en esta sucursal')
@@ -127,6 +131,9 @@ def create_router(current_user, get_connection):
             connection.execute('DELETE FROM shelf_product WHERE shelf_id=%s', (shelf_id,))
             connection.execute(
                 'UPDATE shelf SET is_active=FALSE, updated_at=NOW() WHERE id=%s', (shelf_id,))
+            record_change(connection, branch_id, user, 'shelf.deleted',
+                          before={'id': str(row['id']), 'name': row.get('name'),
+                                  'location': row.get('location_label')}, after=None)
             connection.commit()
         response.headers['Cache-Control'] = 'no-store'
         return {'id': str(shelf_id), 'deleted': True}
@@ -167,6 +174,10 @@ def create_router(current_user, get_connection):
                     '''INSERT INTO shelf_product(shelf_id, product_id, branch_id, created_by)
                        VALUES(%s,%s,%s,%s)''',
                     (shelf_id, body.product_id, branch_id, user['id']))
+                record_change(connection, branch_id, user, 'shelf.product_added',
+                              before=None, after={'shelf_id': str(shelf_id),
+                                                  'product_id': str(body.product_id),
+                                                  'name': product['name']})
                 connection.commit()
             except UniqueViolation:
                 connection.rollback()
@@ -192,6 +203,9 @@ def create_router(current_user, get_connection):
             connection.execute(
                 'DELETE FROM shelf_product WHERE shelf_id=%s AND product_id=%s AND branch_id=%s',
                 (shelf_id, product_id, branch_id))
+            record_change(connection, branch_id, user, 'shelf.product_removed',
+                          before={'shelf_id': str(shelf_id), 'product_id': str(product_id)},
+                          after=None, message='Producto retirado de la repisa')
             connection.commit()
         response.headers['Cache-Control'] = 'no-store'
         return {'id': str(product_id), 'deleted': True}
