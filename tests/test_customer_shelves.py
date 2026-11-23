@@ -97,8 +97,8 @@ class CustomerShelvesTests(unittest.TestCase):
             [{'id': BRANCH, 'name': 'Sucursal Centro', 'organization_id': ORG}],  # require_branch_actor
             [{'total': 1}],  # count shelves
             [{'id': SHELF, 'name': 'Estante A1', 'location_label': 'Pasillo 2'}],  # shelves
-            {'c': 3},  # product count
-            {'c': 1},  # guide count
+            [{'shelf_id': SHELF, 'c': 3}],  # product counts (una consulta agrupada)
+            [{'shelf_id': SHELF, 'c': 1}],  # guide counts (una consulta agrupada)
         ])
         with self.use_connection(connection):
             response = self.client.get(f'/customer/branches/{BRANCH}/shelves?page=1&page_size=5', headers={'Authorization': 'Bearer fake'})
@@ -113,6 +113,8 @@ class CustomerShelvesTests(unittest.TestCase):
         self.assertEqual(item['location'], 'Pasillo 2')
         self.assertEqual(item['product_count'], 3)
         self.assertEqual(item['guide_count'], 1)
+        # Contrato reducido: ni UUID expuesto, ni canales, GPIO ni configuración.
+        self.assertEqual(set(item), {'id', 'name', 'location', 'product_count', 'guide_count'})
 
 
 if __name__ == '__main__':

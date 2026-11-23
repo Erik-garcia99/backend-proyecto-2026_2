@@ -12,6 +12,7 @@ from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field
 
 from .devices import ShelfCreate
+from .logs import record_change
 from .permissions import require_branch_actor
 
 log = logging.getLogger(__name__)
@@ -23,13 +24,13 @@ class ProductLink(BaseModel):
 
 
 PRODUCT_COLUMNS = '''
-    SELECT p.id, p.sku, p.name,
+    SELECT p.id, p.sku, p.name, p.is_active,
            CASE WHEN spec.config_version > 0 AND spec.width_mm IS NOT NULL
                      AND spec.height_mm IS NOT NULL AND spec.depth_mm IS NOT NULL
                      AND spec.usual_orientation IS NOT NULL
                 THEN TRUE ELSE FALSE END AS physical_configured
       FROM shelf_product sp
-      JOIN product p ON p.id=sp.product_id AND p.is_active
+      JOIN product p ON p.id=sp.product_id
       LEFT JOIN product_physical_spec spec ON spec.product_id=p.id
 '''
 
@@ -38,11 +39,15 @@ def _shelf(row):
     return {'id': str(row['id']), 'name': row['name'],
             'location': row.get('location_label'),
             'cameraNodeId': str(row['camera_node_id']) if row.get('camera_node_id') else None,
+            'cameraName': row.get('camera_name'),
             'active': bool(row.get('is_active', True))}
 
 
 def _product(row):
+    # Un producto dado de baja sigue visible en staff como "Inactivo": así se
+    # puede retirar de la repisa en vez de desaparecer en silencio.
     return {'id': str(row['id']), 'sku': row['sku'], 'name': row['name'],
+            'active': bool(row.get('is_active', True)),
             'physicalConfigured': bool(row['physical_configured'])}
 
 
@@ -59,6 +64,9 @@ def create_router(current_user, get_connection):
                    VALUES(%s,%s,%s)
                    RETURNING id, name, location_label, camera_node_id, is_active''',
                 (branch_id, body.name, body.location_label)).fetchone()
+            record_change(connection, branch_id, user, 'shelf.created',
+                          before=None, after={'id': str(row['id']), 'name': row['name'],
+                                              'location': row['location_label']})
             connection.commit()
         response.headers['Cache-Control'] = 'no-store'
         return _shelf(row)
@@ -69,8 +77,11 @@ def create_router(current_user, get_connection):
         with get_connection() as connection:
             require_branch_actor(connection, branch_id, user, admin=True, staff=True)
             row = connection.execute(
-                '''SELECT id, name, location_label, camera_node_id, is_active
-                     FROM shelf WHERE id=%s AND branch_id=%s AND is_active''',
+                '''SELECT s.id, s.name, s.location_label, s.camera_node_id, s.is_active,
+                          cam.name AS camera_name
+                     FROM shelf s
+                     LEFT JOIN esp32_node cam ON cam.id=s.camera_node_id
+                    WHERE s.id=%s AND s.branch_id=%s AND s.is_active''',
                 (shelf_id, branch_id)).fetchone()
             if not row:
                 raise HTTPException(404, 'Repisa no encontrada en esta sucursal')
@@ -80,12 +91,26 @@ def create_router(current_user, get_connection):
             lights = connection.execute(
                 '''SELECT id, name, led_index, node_id FROM led_guide_point
                     WHERE shelf_id=%s ORDER BY led_index''', (shelf_id,)).fetchall()
+            light_products = connection.execute(
+                '''SELECT gpl.guide_point_id, p.id, p.name, p.sku
+                     FROM guide_product_light gpl
+                     JOIN led_guide_point gp ON gp.id=gpl.guide_point_id
+                     JOIN product p ON p.id=gpl.product_id AND p.is_active
+                    WHERE gpl.branch_id=%s AND gp.shelf_id=%s
+                    ORDER BY p.name, p.sku''',
+                (branch_id, shelf_id)).fetchall()
+        products_by_light = {}
+        for item in light_products:
+            products_by_light.setdefault(str(item['guide_point_id']), []).append(
+                {'id': str(item['id']), 'name': item['name'], 'sku': item['sku']})
         response.headers['Cache-Control'] = 'no-store'
         return {**_shelf(row),
                 'products': [_product(product) for product in products],
                 'lights': [{'id': str(light['id']), 'name': light['name'],
                             'channel': int(light['led_index']),
-                            'nodeId': str(light['node_id'])} for light in lights]}
+                            'nodeId': str(light['node_id']),
+                            'products': products_by_light.get(str(light['id']), [])}
+                           for light in lights]}
 
     @router.delete('/branches/{branch_id}/shelves/{shelf_id}')
     def delete_shelf(branch_id: UUID, shelf_id: UUID, response: Response,
@@ -93,7 +118,7 @@ def create_router(current_user, get_connection):
         with get_connection() as connection:
             require_branch_actor(connection, branch_id, user, admin=True)
             row = connection.execute(
-                'SELECT id FROM shelf WHERE id=%s AND branch_id=%s AND is_active',
+                'SELECT id,name,location_label FROM shelf WHERE id=%s AND branch_id=%s AND is_active',
                 (shelf_id, branch_id)).fetchone()
             if not row:
                 raise HTTPException(404, 'Repisa no encontrada en esta sucursal')
@@ -106,6 +131,9 @@ def create_router(current_user, get_connection):
             connection.execute('DELETE FROM shelf_product WHERE shelf_id=%s', (shelf_id,))
             connection.execute(
                 'UPDATE shelf SET is_active=FALSE, updated_at=NOW() WHERE id=%s', (shelf_id,))
+            record_change(connection, branch_id, user, 'shelf.deleted',
+                          before={'id': str(row['id']), 'name': row.get('name'),
+                                  'location': row.get('location_label')}, after=None)
             connection.commit()
         response.headers['Cache-Control'] = 'no-store'
         return {'id': str(shelf_id), 'deleted': True}
@@ -146,6 +174,10 @@ def create_router(current_user, get_connection):
                     '''INSERT INTO shelf_product(shelf_id, product_id, branch_id, created_by)
                        VALUES(%s,%s,%s,%s)''',
                     (shelf_id, body.product_id, branch_id, user['id']))
+                record_change(connection, branch_id, user, 'shelf.product_added',
+                              before=None, after={'shelf_id': str(shelf_id),
+                                                  'product_id': str(body.product_id),
+                                                  'name': product['name']})
                 connection.commit()
             except UniqueViolation:
                 connection.rollback()
@@ -155,12 +187,25 @@ def create_router(current_user, get_connection):
 
     @router.delete('/branches/{branch_id}/shelves/{shelf_id}/products/{product_id}')
     def remove_product(branch_id: UUID, shelf_id: UUID, product_id: UUID,
-                       response: Response, user=Depends(current_user)):
+                       response: Response, user=Depends(current_user),
+                       with_light: bool = False):
         with get_connection() as connection:
             require_branch_actor(connection, branch_id, user, admin=True)
+            linked = connection.execute(
+                '''SELECT 1 FROM guide_product_light lpl
+                    JOIN led_guide_point gp ON gp.id=lpl.guide_point_id
+                   WHERE lpl.branch_id=%s AND lpl.product_id=%s AND gp.shelf_id=%s
+                   LIMIT 1''',
+                (branch_id, product_id, shelf_id)).fetchone()
+            if linked and not with_light:
+                raise HTTPException(
+                    409, 'Este producto tiene un LED asociado en la repisa; retira la asociación antes de quitarlo.')
             connection.execute(
                 'DELETE FROM shelf_product WHERE shelf_id=%s AND product_id=%s AND branch_id=%s',
                 (shelf_id, product_id, branch_id))
+            record_change(connection, branch_id, user, 'shelf.product_removed',
+                          before={'shelf_id': str(shelf_id), 'product_id': str(product_id)},
+                          after=None, message='Producto retirado de la repisa')
             connection.commit()
         response.headers['Cache-Control'] = 'no-store'
         return {'id': str(product_id), 'deleted': True}

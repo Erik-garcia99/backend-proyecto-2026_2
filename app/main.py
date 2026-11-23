@@ -11,6 +11,7 @@ from psycopg.errors import UniqueViolation
 from . import db
 from .shelf_products import create_router as shelf_products_router
 from .physical_config import create_router as physical_config_router
+from .logs import create_router as logs_router
 from .roi_classification import create_router as roi_classification_router
 from .alerts import create_router as alerts_router, monitor as alerts_monitor
 from .visual_alerts import monitor as visual_alerts_monitor
@@ -441,6 +442,7 @@ app.include_router(calibrations_router(current_user, db.get_connection, gateway_
 app.include_router(telemetry_router(current_user, db.get_connection))
 app.include_router(shelf_products_router(current_user, db.get_connection))
 app.include_router(physical_config_router(current_user, db.get_connection))
+app.include_router(logs_router(current_user, db.get_connection))
 app.include_router(roi_classification_router(current_user, db.get_connection))
 app.include_router(pos_router(current_user, db.get_connection))
 
@@ -678,38 +680,48 @@ def customer_shelves(branch_id: UUID,
                ORDER BY name ASC LIMIT %s OFFSET %s''',
             (branch_id, page_size, offset)).fetchall()
 
-        items = []
-        for sh in shelf_rows:
-            shelf_id = sh['id']
-            prod_row = connection.execute(
-                '''SELECT COUNT(DISTINCT pid) AS c FROM (
-                       SELECT r.product_id AS pid
-                         FROM roi r
-                         JOIN product p ON p.id=r.product_id AND p.is_active
-                        WHERE r.shelf_id=%s AND r.is_active=TRUE AND p.organization_id=%s
-                       UNION
-                       SELECT gpl.product_id AS pid
+        shelf_ids = [sh['id'] for sh in shelf_rows]
+        product_counts = {}
+        guide_counts = {}
+        if shelf_ids:
+            for row in connection.execute(
+                    '''SELECT shelf_id, COUNT(DISTINCT product_id) AS c FROM (
+                           SELECT r.shelf_id AS shelf_id, r.product_id AS product_id
+                             FROM roi r
+                             JOIN product p ON p.id=r.product_id AND p.is_active
+                            WHERE r.shelf_id = ANY(%s) AND r.is_active=TRUE
+                              AND p.organization_id=%s
+                           UNION
+                           SELECT gp.shelf_id, gpl.product_id
+                             FROM guide_product_light gpl
+                             JOIN product p ON p.id=gpl.product_id AND p.is_active
+                             JOIN led_guide_point gp ON gp.id=gpl.guide_point_id
+                            WHERE gpl.branch_id=%s AND gp.shelf_id = ANY(%s)
+                              AND p.organization_id=%s
+                       ) t GROUP BY shelf_id''',
+                    (shelf_ids, org_id, branch_id, shelf_ids, org_id)).fetchall():
+                product_counts[row['shelf_id']] = int(row['c'] or 0)
+            for row in connection.execute(
+                    '''SELECT gp.shelf_id, COUNT(DISTINCT gpl.product_id) AS c
                          FROM guide_product_light gpl
                          JOIN product p ON p.id=gpl.product_id AND p.is_active
                          JOIN led_guide_point gp ON gp.id=gpl.guide_point_id
-                        WHERE gpl.branch_id=%s AND gp.shelf_id=%s AND p.organization_id=%s
-                   ) t''',
-                (shelf_id, org_id, branch_id, shelf_id, org_id)).fetchone()
-            guide_row = connection.execute(
-                '''SELECT COUNT(DISTINCT gpl.product_id) AS c
-                     FROM guide_product_light gpl
-                     JOIN product p ON p.id=gpl.product_id AND p.is_active
-                     JOIN led_guide_point gp ON gp.id=gpl.guide_point_id
-                    WHERE gpl.branch_id=%s AND gp.shelf_id=%s AND p.organization_id=%s''',
-                (branch_id, shelf_id, org_id)).fetchone()
+                        WHERE gpl.branch_id=%s AND gp.shelf_id = ANY(%s)
+                          AND p.organization_id=%s
+                        GROUP BY gp.shelf_id''',
+                    (branch_id, shelf_ids, org_id)).fetchall():
+                guide_counts[row['shelf_id']] = int(row['c'] or 0)
 
-            items.append(CustomerShelfItem(
-                id=str(shelf_id),
+        items = [
+            CustomerShelfItem(
+                id=str(sh['id']),
                 name=sh['name'],
                 location=sh.get('location_label'),
-                product_count=int((prod_row or {}).get('c') or 0),
-                guide_count=int((guide_row or {}).get('c') or 0),
-            ))
+                product_count=product_counts.get(sh['id'], 0),
+                guide_count=guide_counts.get(sh['id'], 0),
+            )
+            for sh in shelf_rows
+        ]
 
         return CustomerShelvesResponse(
             items=items,
