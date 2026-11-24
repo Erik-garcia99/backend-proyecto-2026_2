@@ -3,8 +3,8 @@ import unittest
 from fastapi import HTTPException
 
 from app.permissions import (
-    ADMIN, CUSTOMER, STAFF, is_admin, is_customer, is_staff, is_superuser,
-    require_actor, require_branch_actor,
+    ADMIN, CUSTOMER, STAFF, can_approve_users, can_create_users, is_admin,
+    is_customer, is_staff, is_superuser, require_actor, require_branch_actor,
 )
 
 BRANCH = 'b1a7c0de-3f25-4c8a-9b6e-7d2f5a9c1e33'
@@ -34,6 +34,21 @@ class FakeConnection:
 
 
 class RoleTests(unittest.TestCase):
+    def test_create_and_approve_are_separate_powers(self):
+        for role in ('owner', 'rh', 'manager', 'gerencia', 'sudo'):
+            with self.subTest(creator=role):
+                self.assertTrue(can_create_users(user(role, superuser=role == 'sudo')))
+        for role in ('employee', 'staff', 'customer'):
+            with self.subTest(creator=role):
+                self.assertFalse(can_create_users(user(role)))
+
+        for role in ('owner', 'rh', 'sudo'):
+            with self.subTest(approver=role):
+                self.assertTrue(can_approve_users(user(role, superuser=role == 'sudo')))
+        for role in ('manager', 'gerencia', 'employee', 'staff', 'customer'):
+            with self.subTest(approver=role):
+                self.assertFalse(can_approve_users(user(role)))
+
     def test_predicates(self):
         self.assertTrue(is_superuser(user('sudo', superuser=True)))
         self.assertTrue(is_admin(user('owner')))

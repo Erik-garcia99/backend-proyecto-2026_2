@@ -25,7 +25,8 @@ from .pos import PosError, create_router as pos_router, error_response as pos_er
 from .node_registration import make_router as node_router
 from .telemetry import (create_router as telemetry_router, read_occupancy, InfluxSettings, replace)
 from .registration_tokens import create_router as token_router, validate_branch_token, require_branch_access
-from .permissions import require_actor, require_branch_actor, CUSTOMER, is_superuser, role
+from .permissions import (can_approve_users, require_actor, require_branch_actor,
+                          CUSTOMER, is_superuser, role)
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerBranchItem, CustomerBranchesResponse,
                       CustomerCategoriesResponse, CustomerHomeResponse, CustomerProductItem, CustomerProductsResponse,
                       CustomerRegisterRequest, CustomerShelfItem, CustomerShelvesResponse,
@@ -337,8 +338,8 @@ def set_customer_code(organization_id: UUID, user=Depends(current_user)):
 @app.get('/auth/pending', response_model=list[PendingUserResponse])
 def pending_users(user=Depends(current_user)):
     role = user['role'].lower()
-    if not (user['is_superuser'] or role in {'owner', 'rh'}):
-        raise HTTPException(403, 'No tienes permisos para aprobar usuarios')
+    if not can_approve_users(user):
+        raise HTTPException(403, 'No tienes permisos para aprobar usuarios; solo owner o RRHH')
     with db.get_connection() as connection:
         if user['is_superuser']:
             rows = connection.execute('''SELECT * FROM "user" WHERE account_status='pending' AND deactivated_at IS NULL
@@ -358,8 +359,8 @@ def pending_users(user=Depends(current_user)):
 
 @app.post('/auth/reject/{user_id}', response_model=MessageResponse)
 def reject_user(user_id: UUID, approver=Depends(current_user)):
-    if not (approver['is_superuser'] or approver['role'].lower() in {'owner', 'rh'}):
-        raise HTTPException(403, 'No tienes permisos para rechazar usuarios')
+    if not can_approve_users(approver):
+        raise HTTPException(403, 'No tienes permisos para rechazar usuarios; solo owner o RRHH')
     with db.get_connection() as connection:
         target = connection.execute('''SELECT * FROM "user" WHERE id=%s AND account_status='pending'
             AND deactivated_at IS NULL FOR UPDATE''', (user_id,)).fetchone()
@@ -418,8 +419,8 @@ def create_branch(request: BranchCreateRequest,response:Response,creator=Depends
 
 @app.post('/auth/approve/{user_id}',response_model=UserResponse)
 def approve_user(user_id:UUID,approver=Depends(current_user)):
-    if not (approver['is_superuser'] or approver['role'].lower() in {'owner', 'rh'}):
-        raise HTTPException(403, 'No tienes permisos para aprobar usuarios')
+    if not can_approve_users(approver):
+        raise HTTPException(403, 'No tienes permisos para aprobar usuarios; solo owner o RRHH')
     with db.get_connection() as connection:
         target=connection.execute('SELECT * FROM "user" WHERE id=%s AND account_status=\'pending\' AND deactivated_at IS NULL FOR UPDATE',(user_id,)).fetchone()
         if not target:raise HTTPException(404,'Cuenta pendiente no encontrada')

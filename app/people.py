@@ -19,7 +19,7 @@ from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field
 
 from .logs import record_change
-from .permissions import require_branch_actor
+from .permissions import can_approve_users, can_create_users, require_branch_actor
 from .schemas import EMAIL_PATTERN
 from .security import hash_password
 
@@ -203,19 +203,24 @@ def create_router(current_user, get_connection):
         role = body.role.lower()
         if role not in ASSIGNABLE_ROLES:
             raise HTTPException(422, 'El rol debe ser manager, rh, gerencia o employee; owner, sudo y staff no se crean aquí')
+        if not can_create_users(user):
+            raise HTTPException(403, 'Solo owner, RRHH, gerente o gerencia pueden dar de alta personal')
+        # Doble verificación: gerente/gerencia crean, pero owner/RRHH aprueban.
+        status = 'active' if can_approve_users(user) else 'pending'
         with get_connection() as connection:
             branch = require_branch_actor(connection, branch_id, user, admin=True)
             args = (branch['organization_id'], branch['id'], body.email.lower(),
                     body.first_name, body.last_name, body.phone_number or None,
-                    hash_password(body.password), role)
+                    hash_password(body.password), role, status)
             try:
                 row = connection.execute(
                     f'''INSERT INTO "user" (organization_id, branch_id, email, first_name,
                            last_name, phone_number, password_hash, role, account_status)
-                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'active')
+                        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         RETURNING {PERSON_COLUMNS}''', args).fetchone()
                 record_change(connection, branch_id, user, 'employee.created',
-                              after={'id': str(row['id']), 'email': row['email'], 'role': role})
+                              after={'id': str(row['id']), 'email': row['email'],
+                                     'role': role, 'accountStatus': status})
                 connection.commit()
             except UniqueViolation:
                 connection.rollback()

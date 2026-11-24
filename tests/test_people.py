@@ -154,6 +154,29 @@ class PeopleEndpointTests(unittest.TestCase):
                             for _, params in self.connection.executed))
         self.assertEqual(self.connection.commits, 1)
 
+    def test_manager_creates_pending_and_owner_creates_active(self):
+        self.user.update(role='manager', is_superuser=False)
+        response = self.client.post(f'/branches/{BRANCH}/employees', json={
+            'email': 'creado@selfiq.local', 'password': 'ClaveSegura123',
+            'first_name': 'Nuevo', 'last_name': 'Empleado', 'role': 'employee',
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        insert = next(params for sql, params in self.connection.executed
+                      if 'INSERT INTO "user"' in sql)
+        self.assertEqual(insert[-1], 'pending',
+                         'El gerente crea pero no aprueba: queda pendiente de owner/RRHH')
+
+        self.user.update(role='owner')
+        self.connection = FakeConnection()
+        response = self.client.post(f'/branches/{BRANCH}/employees', json={
+            'email': 'creado2@selfiq.local', 'password': 'ClaveSegura123',
+            'first_name': 'Otra', 'last_name': 'Empleada', 'role': 'employee',
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        insert = next(params for sql, params in self.connection.executed
+                      if 'INSERT INTO "user"' in sql)
+        self.assertEqual(insert[-1], 'active')
+
     def test_create_employee_accepts_any_assignable_role(self):
         for role in ('manager', 'rh', 'gerencia', 'employee'):
             with self.subTest(role=role):
@@ -165,6 +188,9 @@ class PeopleEndpointTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 201, response.text)
                 self.assertEqual(response.json()['role'], role,
                                  'El valor del rol viaja sin traducir al backend')
+                insert = next(params for sql, params in self.connection.executed
+                              if 'INSERT INTO "user"' in sql)
+                self.assertEqual(insert[-1], 'active', 'Owner crea cuentas activas')
         # `staff` era alias de `employee`: no se crea, pero sigue listándose.
         for reserved in ('owner', 'sudo', 'customer', 'staff'):
             with self.subTest(reserved=reserved):

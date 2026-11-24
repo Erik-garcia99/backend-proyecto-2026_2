@@ -12,6 +12,11 @@ ADMIN_ROLES = frozenset({'owner', 'manager', 'rh', 'gerencia'})
 STAFF_ROLES = frozenset({'employee', 'staff'})
 CUSTOMER_ROLES = frozenset({'customer'})
 
+# F-02 (decisión del operador 23/11): crear y aprobar son poderes distintos.
+# Owner/RRHH hacen las dos cosas; gerente y gerencia crean, pero no aprueban.
+USER_CREATOR_ROLES = frozenset({'owner', 'rh', 'manager', 'gerencia'})
+USER_APPROVER_ROLES = frozenset({'owner', 'rh'})
+
 ADMIN = 'admin'
 STAFF = 'staff'
 CUSTOMER = 'customer'
@@ -39,6 +44,16 @@ def is_staff(user):
 def is_customer(user):
     """C: cliente de la app móvil."""
     return role(user) in CUSTOMER_ROLES
+
+
+def can_create_users(user):
+    """Puede dar de alta personal; SUDO siempre."""
+    return is_superuser(user) or role(user) in USER_CREATOR_ROLES
+
+
+def can_approve_users(user):
+    """Puede aprobar/rechazar cuentas. Gerente y gerencia NO: doble verificación."""
+    return is_superuser(user) or role(user) in USER_APPROVER_ROLES
 
 
 def require_actor(user, *allowed):
