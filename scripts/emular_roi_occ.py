@@ -13,8 +13,8 @@ Dos modos:
     --calibration-version con los valores de tu sucursal/ROI de prueba.
 
 Uso:
-  uv run --with 'argon2-cffi>=23,<25' python scripts/emular_roi_occ.py --mock
-  INFLUXDB_URL=https://... INFLUXDB_TOKEN=... INFLUXDB_ORG=... INFLUXDB_BUCKET=... \
+  PYTHONPATH=. uv run --with 'argon2-cffi>=23,<25' python scripts/emular_roi_occ.py --mock
+  PYTHONPATH=. INFLUXDB_URL=https://... INFLUXDB_TOKEN=... INFLUXDB_ORG=... INFLUXDB_BUCKET=... \
     uv run python scripts/emular_roi_occ.py --influx-write \
       --branch-id ... --node-id ... --roi-id ... --config-version 43 --calibration-version 1
 

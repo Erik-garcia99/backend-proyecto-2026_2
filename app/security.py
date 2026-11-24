@@ -75,3 +75,30 @@ def create_access_token(user_id: str, session_id=None) -> str:
 
 def decode_access_token(token: str) -> dict:
     return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+
+
+# El desbloqueo del POS es un permiso de corta duración, distinto del access
+# token: la contraseña solo se pide al desbloquear, no en cada venta.
+POS_UNLOCK_MINUTES = 20
+
+
+def create_pos_unlock_token(user_id: str, branch_id: str) -> tuple[str, datetime]:
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(minutes=POS_UNLOCK_MINUTES)
+    payload = {
+        "sub": str(user_id),
+        "branch_id": str(branch_id),
+        "scope": "pos_unlock",
+        "iat": now,
+        "exp": expires_at,
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM), expires_at
+
+
+def decode_pos_unlock_token(token: str, user_id: str, branch_id: str) -> dict:
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    if payload.get('scope') != 'pos_unlock':
+        raise jwt.InvalidTokenError('Token no es de desbloqueo POS')
+    if str(payload.get('sub')) != str(user_id) or str(payload.get('branch_id')) != str(branch_id):
+        raise jwt.InvalidTokenError('Token de otra sesión o sucursal')
+    return payload

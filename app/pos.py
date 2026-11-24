@@ -9,6 +9,8 @@ import hashlib
 import json
 import logging
 
+import jwt
+
 log = logging.getLogger('selfiq.pos')
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -22,8 +24,15 @@ from .schemas_pos import (
     GoodsReceiptCreate,
     ReturnRequest,
     SaleCreate,
+    SellerGrantRequest,
+    UnlockRequest,
     VoidRequest,
 )
+from .permissions import (POS_SELLER_ALWAYS_ROLES, can_grant_pos_sellers,
+                          can_sell_pos_by_role)
+from .security import (create_pos_unlock_token, decode_pos_unlock_token,
+                       verify_password)
+from .logs import record_change
 
 MONEY = Decimal('0.01')
 MOVEMENT_TYPES = ['sale', 'sale_void', 'return', 'receipt', 'adjustment_in', 'adjustment_out']
@@ -90,6 +99,7 @@ def create_router(current_user, get_connection):
         'pos.receipt.confirm': {'owner', 'gerencia', 'rh', 'manager'},
         'pos.inventory.adjust': {'owner', 'gerencia', 'rh', 'manager'},
         'pos.inventory.movements.read': {'owner', 'gerencia', 'rh', 'manager', 'employee', 'staff'},
+        'pos.seller.manage': {'owner', 'rh'},
     }
 
     def require_action(user, action):
@@ -100,6 +110,33 @@ def create_router(current_user, get_connection):
             log.warning('pos.permission.denied', extra={
                 'user_id': str(user.get('id')), 'role': role, 'action': action})
             raise PosError(403, 'FORBIDDEN', 'No tienes permiso para esta acción.')
+
+    def require_seller(cursor, user, branch_id):
+        """Vender es un permiso por persona, no por rol (excepto sudo/owner)."""
+        if can_sell_pos_by_role(user):
+            return
+        row = cursor.execute(
+            '''SELECT 1 FROM pos_seller
+               WHERE branch_id=%s AND user_id=%s AND revoked_at IS NULL''',
+            (branch_id, user['id'])).fetchone()
+        if not row:
+            log.warning('pos.seller.denied', extra={
+                'user_id': str(user.get('id')), 'branch_id': str(branch_id),
+                'role': (user.get('role') or '').lower()})
+            raise PosError(403, 'POS_SELLER_NOT_ALLOWED',
+                           'No tienes permiso para vender en esta sucursal. '
+                           'Pide a Recursos Humanos que te autorice.')
+
+    def require_unlock(user, branch_id, token):
+        """Exige desbloqueo reciente con contraseña; 423 si falta o expiró."""
+        if not token:
+            raise PosError(423, 'POS_LOCKED',
+                           'Escribe tu contraseña para desbloquear la caja.')
+        try:
+            decode_pos_unlock_token(token, user['id'], branch_id)
+        except jwt.InvalidTokenError:
+            raise PosError(423, 'POS_LOCKED',
+                           'El desbloqueo venció. Escribe tu contraseña de nuevo.')
 
     def product_row(cursor, product_id, org_id):
         row = cursor.execute(
@@ -205,6 +242,7 @@ def create_router(current_user, get_connection):
     @router.post('/branches/{branch_id}/sales', status_code=201)
     def create_sale(branch_id: UUID, request: SaleCreate,
                     idempotency_key: str = Header(..., alias='Idempotency-Key'),
+                    x_pos_unlock: str | None = Header(default=None, alias='X-POS-Unlock'),
                     user=Depends(current_user)):
         body = request.model_dump(mode='json')
         digest = _body_hash(body)
@@ -212,6 +250,8 @@ def create_router(current_user, get_connection):
             with conn.cursor() as cursor:
                 try:
                     org_id = branch_org(cursor, user, branch_id)
+                    require_seller(cursor, user, branch_id)
+                    require_unlock(user, branch_id, x_pos_unlock)
                     inserted = cursor.execute(
                         '''INSERT INTO idempotency_key (branch_id, key, user_id, body_hash, status)
                            VALUES (%s,%s,%s,%s,'pending')
@@ -694,5 +734,94 @@ def create_router(current_user, get_connection):
                     'visual': visual,
                     'checked_at': checked_at.isoformat(),
                 }
+
+    @router.post('/branches/{branch_id}/pos/unlock')
+    def unlock_pos(branch_id: UUID, request: UnlockRequest, user=Depends(current_user)):
+        """Desbloquea la caja al verificar la contraseña del usuario actual."""
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                branch_org(cursor, user, branch_id)
+                require_seller(cursor, user, branch_id)
+                if not verify_password(request.password, user.get('password_hash') or ''):
+                    log.warning('pos.unlock.failed', extra={
+                        'user_id': str(user.get('id')), 'branch_id': str(branch_id)})
+                    raise PosError(401, 'INVALID_PASSWORD', 'La contraseña no es correcta.')
+        token, expires_at = create_pos_unlock_token(user['id'], branch_id)
+        return {'token': token, 'unlocked_until': expires_at.isoformat()}
+
+    @router.get('/branches/{branch_id}/pos/sellers')
+    def list_sellers(branch_id: UUID, user=Depends(current_user)):
+        """Empleados de la sucursal/organización y si pueden vender."""
+        if not can_grant_pos_sellers(user):
+            raise PosError(403, 'FORBIDDEN', 'No tienes permiso para administrar vendedores.')
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                org_id = branch_org(cursor, user, branch_id)
+                params = [branch_id, org_id]
+                scope = ''
+                if not user.get('is_superuser') and (user.get('role') or '').lower() not in {'owner', 'gerencia'}:
+                    scope = 'AND u.branch_id=%s'
+                    params.append(branch_id)
+                rows = cursor.execute(
+                    f'''SELECT u.id AS user_id, u.email, u.first_name, u.last_name, u.role,
+                               ps.granted_by, ps.granted_at
+                        FROM "user" u
+                        LEFT JOIN pos_seller ps
+                          ON ps.user_id=u.id AND ps.branch_id=%s AND ps.revoked_at IS NULL
+                        WHERE u.organization_id=%s AND u.deactivated_at IS NULL
+                          AND lower(u.role) <> 'customer' {scope}
+                        ORDER BY u.first_name, u.last_name''', params).fetchall()
+        return [{
+            'user_id': str(r['user_id']), 'email': r['email'],
+            'first_name': r['first_name'], 'last_name': r['last_name'],
+            'role': r['role'], 'can_sell': r['granted_by'] is not None or
+                (user.get('is_superuser') or (r['role'] or '').lower() in POS_SELLER_ALWAYS_ROLES),
+            'granted_by': str(r['granted_by']) if r['granted_by'] else None,
+            'granted_at': _iso(r['granted_at']),
+        } for r in rows]
+
+    @router.post('/branches/{branch_id}/pos/sellers', status_code=201)
+    def grant_seller(branch_id: UUID, request: SellerGrantRequest, user=Depends(current_user)):
+        if not can_grant_pos_sellers(user):
+            raise PosError(403, 'FORBIDDEN', 'No tienes permiso para otorgar ventas.')
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                org_id = branch_org(cursor, user, branch_id)
+                target = cursor.execute(
+                    '''SELECT id, organization_id, branch_id, role, deactivated_at
+                       FROM "user" WHERE id=%s''', (request.user_id,)).fetchone()
+                if (not target or target['deactivated_at'] is not None
+                        or str(target['organization_id']) != str(org_id)
+                        or (target['role'] or '').lower() == 'customer'):
+                    raise PosError(422, 'SELLER_NOT_ALLOWED',
+                                   'El usuario no puede vender en esta sucursal.')
+                cursor.execute(
+                    '''INSERT INTO pos_seller (branch_id, user_id, granted_by, granted_at, revoked_by, revoked_at)
+                       VALUES (%s,%s,%s,now(),NULL,NULL)
+                       ON CONFLICT (branch_id, user_id) DO UPDATE
+                         SET granted_by=EXCLUDED.granted_by, granted_at=now(),
+                             revoked_by=NULL, revoked_at=NULL''',
+                    (branch_id, request.user_id, user['id']))
+                record_change(conn, branch_id, user, 'pos.seller.granted',
+                              after={'user_id': str(request.user_id),
+                                     'granted_by': str(user['id'])})
+        return {'user_id': str(request.user_id), 'can_sell': True}
+
+    @router.delete('/branches/{branch_id}/pos/sellers/{user_id}')
+    def revoke_seller(branch_id: UUID, user_id: UUID, user=Depends(current_user)):
+        if not can_grant_pos_sellers(user):
+            raise PosError(403, 'FORBIDDEN', 'No tienes permiso para revocar ventas.')
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                branch_org(cursor, user, branch_id)
+                updated = cursor.execute(
+                    '''UPDATE pos_seller SET revoked_by=%s, revoked_at=now()
+                       WHERE branch_id=%s AND user_id=%s AND revoked_at IS NULL''',
+                    (user['id'], branch_id, user_id))
+                if updated.rowcount == 0:
+                    raise PosError(404, 'SELLER_NOT_FOUND', 'Ese usuario no tenía permiso activo.')
+                record_change(conn, branch_id, user, 'pos.seller.revoked',
+                              after={'user_id': str(user_id), 'revoked_by': str(user['id'])})
+        return {'user_id': str(user_id), 'can_sell': False}
 
     return router

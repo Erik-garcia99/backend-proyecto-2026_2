@@ -84,6 +84,25 @@ class GoodsReceiptCreate(BaseModel):
     items: list[GoodsReceiptItem] = Field(min_length=1)
 
 
+class UnlockRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=200)
+
+
+class SellerGrantRequest(BaseModel):
+    user_id: UUID
+
+
+class SellerOut(BaseModel):
+    user_id: UUID
+    email: str
+    first_name: str
+    last_name: str
+    role: str
+    can_sell: bool
+    granted_by: UUID | None = None
+    granted_at: str | None = None
+
+
 class SaleOut(BaseModel):
     id: UUID
     sale_number: str
