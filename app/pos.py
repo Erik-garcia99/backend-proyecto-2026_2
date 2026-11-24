@@ -74,12 +74,24 @@ def create_router(current_user, get_connection):
     def branch_org(cursor, user, branch_id):
         row = cursor.execute('SELECT organization_id FROM branch WHERE id=%s AND is_active', (branch_id,)).fetchone()
         if not row:
+            log.warning('pos.access.denied', extra={
+                'user_id': str(user.get('id')), 'branch_id': str(branch_id),
+                'role': (user.get('role') or '').lower(), 'reason': 'branch_not_found'})
             raise PosError(404, 'BRANCH_NOT_FOUND', 'Sucursal no encontrada.')
         if not user['is_superuser'] and str(row['organization_id']) != str(user['organization_id']):
             # No revelar la existencia de sucursales de otra organización.
+            log.warning('pos.access.denied', extra={
+                'user_id': str(user.get('id')), 'branch_id': str(branch_id),
+                'role': (user.get('role') or '').lower(), 'reason': 'other_organization'})
             raise PosError(404, 'BRANCH_NOT_FOUND', 'Sucursal no encontrada.')
-        # Validación por sucursal, no solo por organización.
         role = (user.get('role') or '').lower()
+        # El cliente no entra al POS: la app de clientes tiene sus propias rutas.
+        if role == 'customer':
+            log.warning('pos.access.denied', extra={
+                'user_id': str(user.get('id')), 'branch_id': str(branch_id),
+                'role': role, 'reason': 'customer_role'})
+            raise PosError(403, 'FORBIDDEN', 'Esta sección no está disponible para clientes.')
+        # Validación por sucursal, no solo por organización.
         if not user['is_superuser'] and role not in {'owner', 'gerencia'}:
             if str(user.get('branch_id')) != str(branch_id):
                 log.warning('pos.access.denied', extra={

@@ -5,6 +5,7 @@ y POS_TEST_DB=1. El nombre de la base debe contener "test". Sin eso el módulo
 se omite, para que la suite normal no intente conectarse a producción.
 Sin cámara, InfluxDB, MQTT ni WSS: solo FastAPI + PostgreSQL real.
 """
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -35,6 +36,8 @@ BRANCH = UUID('10000000-0000-4000-8000-000000000002')
 USER_ID = UUID('10000000-0000-4000-8000-000000000003')
 EMPLOYEE_ID = UUID('10000000-0000-4000-8000-000000000004')
 RRHH_ID = UUID('10000000-0000-4000-8000-000000000005')
+OTHER_BRANCH = UUID('10000000-0000-4000-8000-000000000099')
+OTHER_ORG = UUID('20000000-0000-4000-8000-000000000001')
 P1 = UUID('10000000-0000-4000-8000-000000000011')
 P2 = UUID('10000000-0000-4000-8000-000000000012')
 
@@ -427,3 +430,53 @@ def test_rrhh_otorga_pero_no_vende_si_no_se_le_otorga():
     with make_client(user=rrhh) as admin:
         permitida = sell(admin, str(uuid4()), sale_payload(), user_id=RRHH_ID)
         assert permitida.status_code == 201, permitida.text
+
+
+# PS-09: permisos finos y bitácora -------------------------------------------
+def test_ps09_cajero_no_puede_ajustar_inventario_y_queda_en_bitacora(caplog):
+    with caplog.at_level(logging.WARNING, logger='selfiq.pos'):
+        with make_client(user=EMPLOYEE) as cajero:
+            response = cajero.post(
+                f'/api/v1/branches/{BRANCH}/inventory/adjustments',
+                json={'product_id': str(P1), 'quantity_delta': 5, 'reason': 'sin permiso'},
+                headers={'Idempotency-Key': str(uuid4())})
+
+    assert response.status_code == 403, response.text
+    assert response.json()['code'] == 'FORBIDDEN'
+    assert stock() == 5
+    denied = [r for r in caplog.records if r.message == 'pos.permission.denied']
+    assert denied and getattr(denied[0], 'action', None) == 'pos.inventory.adjust'
+
+
+def test_ps09_cliente_no_entra_al_pos_y_queda_en_bitacora(caplog):
+    cliente = {**USER, 'role': 'customer', 'branch_id': BRANCH}
+    with caplog.at_level(logging.WARNING, logger='selfiq.pos'):
+        with make_client(user=cliente) as c:
+            lecturas = [c.get(f'/api/v1/branches/{BRANCH}{path}') for path in (
+                '/inventory', '/sales', '/products', '/inventory/movements')]
+            venta = sell(c, str(uuid4()), sale_payload())
+
+    assert all(r.status_code in (403, 404) for r in [*lecturas, venta])
+    assert all(r.json()['code'] == 'FORBIDDEN' for r in [*lecturas, venta])
+    denied = [r for r in caplog.records if r.message == 'pos.access.denied']
+    assert denied and {getattr(r, 'reason', None) for r in denied} == {'customer_role'}
+
+
+def test_ps09_otra_sucursal_y_otra_organizacion_se_rechazan_y_se_registran(caplog):
+    otra_sucursal = {**USER, 'branch_id': OTHER_BRANCH}
+    with caplog.at_level(logging.WARNING, logger='selfiq.pos'):
+        with make_client(user=otra_sucursal) as c:
+            local = c.get(f'/api/v1/branches/{BRANCH}/inventory')
+    assert local.status_code == 403, local.text
+    assert any(r.message == 'pos.access.denied' and getattr(r, 'reason', None) == 'branch_mismatch'
+               for r in caplog.records)
+
+    caplog.clear()
+    externo = {**OWNER, 'organization_id': OTHER_ORG}
+    with caplog.at_level(logging.WARNING, logger='selfiq.pos'):
+        with make_client(user=externo) as c:
+            remoto = c.get(f'/api/v1/branches/{BRANCH}/inventory')
+    assert remoto.status_code == 404, remoto.text
+    assert remoto.json()['code'] == 'BRANCH_NOT_FOUND'
+    assert any(r.message == 'pos.access.denied' and getattr(r, 'reason', None) == 'other_organization'
+               for r in caplog.records)
