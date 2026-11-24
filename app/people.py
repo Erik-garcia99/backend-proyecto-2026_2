@@ -19,11 +19,14 @@ from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field
 
 from .logs import record_change
-from .permissions import require_branch_actor, STAFF_ROLES
+from .permissions import require_branch_actor
 from .schemas import EMAIL_PATTERN
 from .security import hash_password
 
-EMPLOYEE_ROLES = frozenset(STAFF_ROLES)  # 'employee' y 'staff': sin escalado de permisos
+# Roles que el encargado puede asignar desde el CRUD de personal. `sudo` y
+# `owner` quedan fuera: sudo es un único administrador de la plataforma y
+# owner es quien la inicia; no se crean desde esta pantalla.
+ASSIGNABLE_ROLES = frozenset({'manager', 'rh', 'gerencia', 'employee', 'staff'})
 
 
 # --------------------------------------------------------------------------- #
@@ -132,12 +135,12 @@ def _supplier(row):
 
 
 def _get_person(connection, user_id, branch, *, role, include_inactive=False):
-    clauses = ['id=%s', 'branch_id=%s' if role in EMPLOYEE_ROLES else 'branch_id IS NULL',
+    clauses = ['id=%s', 'branch_id=%s' if role in ASSIGNABLE_ROLES else 'branch_id IS NULL',
                'organization_id=%s', 'lower(role)=ANY(%s)']
     args = [user_id, branch['organization_id']]
-    if role in EMPLOYEE_ROLES:
+    if role in ASSIGNABLE_ROLES:
         args.insert(1, branch['id'])
-    args.append([role] if role not in EMPLOYEE_ROLES else sorted(EMPLOYEE_ROLES))
+    args.append([role] if role not in ASSIGNABLE_ROLES else sorted(ASSIGNABLE_ROLES))
     if not include_inactive:
         clauses.append('deactivated_at IS NULL')
     row = connection.execute(
@@ -181,7 +184,7 @@ def create_router(current_user, get_connection):
         with get_connection() as connection:
             branch = require_branch_actor(connection, branch_id, user, admin=True)
             clauses = ['branch_id=%s', 'organization_id=%s', 'lower(role)=ANY(%s)']
-            args = [branch['id'], branch['organization_id'], sorted(EMPLOYEE_ROLES)]
+            args = [branch['id'], branch['organization_id'], sorted(ASSIGNABLE_ROLES)]
             if not include_inactive:
                 clauses.append('deactivated_at IS NULL')
             rows = connection.execute(
@@ -194,8 +197,8 @@ def create_router(current_user, get_connection):
     def create_employee(branch_id: UUID, body: PersonCreate, response: Response,
                         user=Depends(current_user)):
         role = body.role.lower()
-        if role not in EMPLOYEE_ROLES:
-            raise HTTPException(422, 'El rol debe ser employee o staff; los roles administrativos no se crean aquí')
+        if role not in ASSIGNABLE_ROLES:
+            raise HTTPException(422, 'El rol debe ser manager, rh, gerencia, employee o staff; owner y sudo no se crean aquí')
         with get_connection() as connection:
             branch = require_branch_actor(connection, branch_id, user, admin=True)
             args = (branch['organization_id'], branch['id'], body.email.lower(),
@@ -232,8 +235,8 @@ def create_router(current_user, get_connection):
         changes = body.model_dump(exclude_unset=True, exclude_none=True)
         if 'role' in changes:
             changes['role'] = changes['role'].lower()
-            if changes['role'] not in EMPLOYEE_ROLES:
-                raise HTTPException(422, 'El rol debe ser employee o staff')
+            if changes['role'] not in ASSIGNABLE_ROLES:
+                raise HTTPException(422, 'El rol debe ser manager, rh, gerencia, employee o staff')
         if not changes:
             raise HTTPException(422, 'No se enviaron cambios')
         if 'email' in changes:

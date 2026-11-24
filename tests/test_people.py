@@ -27,10 +27,13 @@ ADMIN = {
 }
 
 
+ASSIGNABLE = {'manager', 'rh', 'gerencia', 'employee', 'staff'}
+
+
 def person_row(user_id=EMP, *, role='employee', email='ana@selfiq.local', active=True):
     return {
         'id': user_id, 'organization_id': ORG,
-        'branch_id': BRANCH if role in ('employee', 'staff') else None,
+        'branch_id': BRANCH if role in ASSIGNABLE else None,
         'email': email, 'first_name': 'Ana', 'last_name': 'López',
         'phone_number': '5551234567', 'role': role, 'account_status': 'active',
         'created_at': datetime(2026, 11, 23, tzinfo=timezone.utc),
@@ -151,13 +154,27 @@ class PeopleEndpointTests(unittest.TestCase):
                             for _, params in self.connection.executed))
         self.assertEqual(self.connection.commits, 1)
 
-    def test_create_employee_rejects_admin_role_and_duplicated_email(self):
-        response = self.client.post(f'/branches/{BRANCH}/employees', json={
-            'email': 'x@selfiq.local', 'password': 'ClaveSegura123',
-            'first_name': 'X', 'last_name': 'Y', 'role': 'owner',
-        })
-        self.assertEqual(response.status_code, 422)
+    def test_create_employee_accepts_any_assignable_role(self):
+        for role in ('manager', 'rh', 'gerencia', 'employee', 'staff'):
+            with self.subTest(role=role):
+                self.connection = FakeConnection()
+                response = self.client.post(f'/branches/{BRANCH}/employees', json={
+                    'email': f'{role}@selfiq.local', 'password': 'ClaveSegura123',
+                    'first_name': 'Nueva', 'last_name': 'Empleada', 'role': role,
+                })
+                self.assertEqual(response.status_code, 201, response.text)
+                self.assertEqual(response.json()['role'], role,
+                                 'El valor del rol viaja sin traducir al backend')
+        for reserved in ('owner', 'sudo', 'customer'):
+            with self.subTest(reserved=reserved):
+                self.connection = FakeConnection()
+                response = self.client.post(f'/branches/{BRANCH}/employees', json={
+                    'email': f'{reserved}@selfiq.local', 'password': 'ClaveSegura123',
+                    'first_name': 'X', 'last_name': 'Y', 'role': reserved,
+                })
+                self.assertEqual(response.status_code, 422)
 
+    def test_create_employee_rejects_duplicated_email(self):
         failing = FakeConnection(error=UniqueViolation('duplicado'))
         self.connection = failing
         response = self.client.post(f'/branches/{BRANCH}/employees', json={
