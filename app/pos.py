@@ -639,7 +639,8 @@ def create_router(current_user, get_connection):
                 # Fuente real: InfluxDB vía Fase 5 (roi_occ). roi_state queda como legado.
                 roi_rows = cursor.execute(
                     '''SELECT r.id AS roi_id, r.name AS roi_name,
-                              s.id AS shelf_id, s.name AS shelf_name, s.location,
+                              s.id AS shelf_id, s.name AS shelf_name,
+                              s.location_label AS location,
                               s.camera_node_id,
                               s.roi_applied_version AS config_version,
                               r.calibration_status,

@@ -211,6 +211,9 @@ def validate_mock():
     check('bloques logical y visual son independientes',
           set(out_a) >= {'logical', 'visual', 'checked_at'})
     assert_no_writes(log_a, 'PS-10')
+    sql_a = ' '.join(log_a)
+    check('la consulta de disponibilidad usa la columna real s.location_label',
+          's.location_label' in sql_a)
 
     print('\n--- PS-11: remapear el ROI a otro SKU no cambia existencias ---')
     data['roi_by_product'] = {str(PRODUCT_B): [roi_row]}  # remapeo A -> B
