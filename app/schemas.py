@@ -29,6 +29,67 @@ class CustomerRegisterRequest(BaseModel):
     last_name: str = Field(min_length=1, max_length=100)
     phone: str | None = Field(default=None, max_length=30)
     organization_slug: str | None = Field(default=None, max_length=100)
+    organization_code: str | None = Field(default=None, max_length=50)
+
+
+class CustomerBranchItem(BaseModel):
+    id: str
+    name: str
+    address: str | None = None
+    business_category: str | None = None
+    max_capacity_people: int | None = None
+
+
+class CustomerBranchesResponse(BaseModel):
+    items: list[CustomerBranchItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class CustomerProductItem(BaseModel):
+    id: str
+    name: str
+    sku: str
+    barcode: str | None = None
+    description: str | None = None
+    sale_price: float = 0.0
+    category: str | None = None
+    shelf_id: str | None = None
+    shelf_name: str | None = None
+    location_label: str | None = None
+    has_guide: bool = False
+    availability: str = 'no_data'
+    availability_label: str = 'Sin información reciente'
+
+
+class CustomerProductsResponse(BaseModel):
+    items: list[CustomerProductItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class CustomerShelfItem(BaseModel):
+    id: str
+    name: str
+    location: str | None = None
+    product_count: int = 0
+    guide_count: int = 0
+
+
+class CustomerShelvesResponse(BaseModel):
+    items: list[CustomerShelfItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+class CustomerCategoriesResponse(BaseModel):
+    categories: list[str]
 
 
 class CustomerHomeResponse(BaseModel):
@@ -40,6 +101,8 @@ class CustomerHomeResponse(BaseModel):
     stale_after_seconds: int
     status: str
     has_catalog: bool = True
+    occupancy_level: str | None = None
+    max_capacity_people: int | None = None
 
 
 class LoginRequest(BaseModel):
@@ -109,6 +172,7 @@ class RefreshRequest(BaseModel):
 
 class RefreshResponse(BaseModel):
     access_token: str
+    refresh_token: str
     token_type: str = "bearer"
     expires_in: int
 

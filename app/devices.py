@@ -25,6 +25,7 @@ from psycopg.errors import UniqueViolation
 from pydantic import BaseModel, ConfigDict, Field
 
 from .registration_tokens import require_branch_access
+from .logs import record_change
 from .permissions import require_branch_actor
 
 LIGHT_LIMIT = 8
@@ -137,6 +138,27 @@ def require_branch(connection, branch_id: UUID, user):
     return branch
 
 
+def require_configured_shelf_products(connection, branch_id: UUID, shelf_id: UUID):
+    """Antes de enlazar una cámara, exige orientación y medidas de los productos de la repisa."""
+    rows = connection.execute(
+        '''SELECT p.name, p.sku,
+                  spec.config_version > 0 AND spec.width_mm IS NOT NULL
+                      AND spec.height_mm IS NOT NULL AND spec.depth_mm IS NOT NULL
+                      AND spec.usual_orientation IS NOT NULL AS ready
+             FROM shelf_product sp
+             JOIN product p ON p.id=sp.product_id AND p.is_active
+             LEFT JOIN product_physical_spec spec ON spec.product_id=p.id
+            WHERE sp.shelf_id=%s AND sp.branch_id=%s
+            ORDER BY p.name''',
+        (shelf_id, branch_id)).fetchall()
+    if not rows:
+        raise HTTPException(409, 'La repisa no tiene productos; agrega y configura al menos uno antes de vincular la cámara')
+    missing = [row for row in rows if not row['ready']]
+    if missing:
+        names = ', '.join(f"{row['name']} ({row['sku']})" for row in missing[:3])
+        raise HTTPException(409, 'Configura primero la orientación y las medidas físicas de: ' + names)
+
+
 def load_node(connection, branch_id: UUID, device_id: UUID, *, node_type=None, lock=False, candidate=False):
     query = '''SELECT n.*, g.branch_id AS gateway_branch_id, g.rpi_identifier,
                       g.display_name AS gateway_name
@@ -217,12 +239,17 @@ def serialize_light(row):
 
 
 def serialize_product(row):
-    return {
+    product = {
         'id': str(row['id']),
         'sku': row['sku'],
         'name': row['name'],
         'active': row['is_active'],
     }
+    # Solo el catálogo consulta la configuración física del producto. Si la
+    # consulta no la trae, no se inventa un valor.
+    if 'physical_configured' in row:
+        product['physicalConfigured'] = bool(row['physical_configured'])
+    return product
 
 
 def serialize_shelf(row):
@@ -388,6 +415,10 @@ def create_router(current_user, get_connection, hub):
                 '''UPDATE esp32_node SET name=%s, location=%s, updated_at=NOW()
                    WHERE id=%s RETURNING *''',
                 (body.name, body.location, device_id)).fetchone()
+            record_change(connection, branch_id, user, 'device.updated',
+                          node_id=device_id,
+                          before={'name': node.get('name'), 'location': node.get('location')},
+                          after={'name': updated.get('name'), 'location': updated.get('location')})
             connection.commit()
             updated = {**updated, 'rpi_identifier': node['rpi_identifier']}
         response.headers['Cache-Control'] = 'no-store'
@@ -452,13 +483,32 @@ def create_router(current_user, get_connection, hub):
     @router.get('/branches/{branch_id}/shelves')
     def list_shelves(branch_id: UUID, response: Response, user=Depends(current_user)):
         with get_connection() as connection:
-            require_branch(connection, branch_id, user)
+            # Lectura de staff: el empleado puede consultar repisas y luces;
+            # la edición sigue limitada a admin en los endpoints de escritura.
+            require_branch_actor(connection, branch_id, user, admin=True, staff=True)
             rows = connection.execute(
-                '''SELECT id, name, location_label FROM shelf
-                   WHERE branch_id=%s AND is_active ORDER BY name''',
+                '''SELECT s.id, s.name, s.location_label, s.camera_node_id,
+                          cam.name AS camera_name,
+                          (SELECT COUNT(*) FROM shelf_product sp
+                             JOIN product p ON p.id=sp.product_id
+                            WHERE sp.shelf_id=s.id) AS product_count,
+                          (SELECT COUNT(*) FROM led_guide_point gp
+                            WHERE gp.shelf_id=s.id) AS light_count,
+                          (SELECT COUNT(DISTINCT gp.node_id) FROM led_guide_point gp
+                            WHERE gp.shelf_id=s.id) AS guide_node_count
+                     FROM shelf s
+                     LEFT JOIN esp32_node cam ON cam.id=s.camera_node_id
+                    WHERE s.branch_id=%s AND s.is_active
+                    ORDER BY s.name''',
                 (branch_id,)).fetchall()
         response.headers['Cache-Control'] = 'no-store'
-        return [{'id': str(row['id']), 'name': row['name'], 'location': row['location_label']}
+        return [{'id': str(row['id']), 'name': row['name'],
+                 'location': row['location_label'],
+                 'cameraNodeId': str(row['camera_node_id']) if row.get('camera_node_id') else None,
+                 'cameraName': row.get('camera_name'),
+                 'productCount': int(row.get('product_count') or 0),
+                 'lightCount': int(row.get('light_count') or 0),
+                 'guideNodeCount': int(row.get('guide_node_count') or 0)}
                 for row in rows]
 
     def shelf_in_branch(connection, branch_id, shelf_id):
@@ -471,14 +521,15 @@ def create_router(current_user, get_connection, hub):
 
     # --- Fase 3: catálogo mínimo de productos y vínculo cámara-repisa ---
 
-    @router.get('/branches/{branch_id}/shelves/{shelf_id}/products')
-    def list_shelf_products(branch_id: UUID, shelf_id: UUID, response: Response,
-                            user=Depends(current_user)):
+    @router.get('/branches/{branch_id}/shelves/{shelf_id}/guide-products')
+    def list_shelf_guide_products(branch_id: UUID, shelf_id: UUID, response: Response,
+                                  user=Depends(current_user)):
         with get_connection() as connection:
             branch = require_branch(connection, branch_id, user)
             shelf_in_branch(connection, branch_id, shelf_id)
-            # Ubicación propia de la guía. Una zona de cámara no asigna un LED
-            # ni es requisito para configurarlo o encenderlo.
+            # Productos ya asociados a los LED de esta repisa (dominio de la guía).
+            # No es la configuración `shelf_product`: esa vive en
+            # `GET /shelves/{shelf_id}/products` (app/shelf_products.py).
             rows = connection.execute(
                 '''SELECT p.id, p.sku, p.name, p.is_active FROM product p
                     WHERE p.organization_id=%s AND p.is_active AND EXISTS (
@@ -500,10 +551,18 @@ def create_router(current_user, get_connection, hub):
             term = (search or '').strip()
             pattern = f'%{term}%' if term else None
             rows = connection.execute(
-                '''SELECT id, sku, name, is_active FROM product
-                   WHERE organization_id=%s AND is_active
-                     AND (%s::text IS NULL OR sku ILIKE %s OR name ILIKE %s)
-                   ORDER BY name, sku LIMIT %s''',
+                '''SELECT p.id, p.sku, p.name, p.is_active,
+                          CASE WHEN spec.config_version > 0
+                                    AND spec.width_mm IS NOT NULL
+                                    AND spec.height_mm IS NOT NULL
+                                    AND spec.depth_mm IS NOT NULL
+                                    AND spec.usual_orientation IS NOT NULL
+                               THEN TRUE ELSE FALSE END AS physical_configured
+                     FROM product p
+                     LEFT JOIN product_physical_spec spec ON spec.product_id=p.id
+                    WHERE p.organization_id=%s AND p.is_active
+                      AND (%s::text IS NULL OR p.sku ILIKE %s OR p.name ILIKE %s)
+                    ORDER BY p.name, p.sku LIMIT %s''',
                 (branch['organization_id'], pattern, pattern, pattern, limit)).fetchall()
         response.headers['Cache-Control'] = 'no-store'
         return [serialize_product(row) for row in rows]
@@ -568,6 +627,7 @@ def create_router(current_user, get_connection, hub):
                 (body.shelf_id, branch_id)).fetchone()
             if not shelf:
                 raise HTTPException(404, 'Estante no encontrado en esta sucursal')
+            require_configured_shelf_products(connection, branch_id, body.shelf_id)
             current = connection.execute(
                 '''SELECT id, name FROM shelf
                    WHERE camera_node_id=%s AND branch_id=%s AND id<>%s''',
@@ -581,6 +641,10 @@ def create_router(current_user, get_connection, hub):
                    SET camera_node_id=%s, camera_node_type='shelf_cam', updated_at=NOW()
                    WHERE id=%s RETURNING *''',
                 (device_id, body.shelf_id)).fetchone()
+            record_change(connection, branch_id, user, 'camera.linked',
+                          node_id=device_id,
+                          before={'shelfId': str(body.shelf_id), 'cameraNodeId': None},
+                          after={'shelfId': str(body.shelf_id), 'cameraNodeId': str(device_id)})
             connection.commit()
         response.headers['Cache-Control'] = 'no-store'
         return serialize_shelf(updated)
@@ -661,6 +725,10 @@ def create_router(current_user, get_connection, hub):
                     '''INSERT INTO led_guide_point(node_id, node_type, shelf_id, led_index, name)
                        VALUES(%s, 'guide', %s, %s, %s) RETURNING *''',
                     (device_id, body.shelf_id, body.channel, body.name)).fetchone()
+                record_change(connection, branch_id, user, 'light.added',
+                              node_id=device_id, before=None,
+                              after={'lightId': str(light['id']), 'channel': body.channel,
+                                     'shelfId': str(body.shelf_id), 'name': body.name})
                 connection.commit()
             except UniqueViolation:
                 connection.rollback()
@@ -693,6 +761,12 @@ def create_router(current_user, get_connection, hub):
                     '''UPDATE led_guide_point SET name=%s, shelf_id=%s
                        WHERE id=%s RETURNING *''',
                     (body.name, body.shelf_id, light_id)).fetchone()
+                record_change(connection, branch_id, user, 'light.updated',
+                              node_id=device_id,
+                              before={'lightId': str(light_id), 'name': light.get('name'),
+                                      'shelfId': str(light['shelf_id'])},
+                              after={'lightId': str(light_id), 'name': updated.get('name'),
+                                     'shelfId': str(body.shelf_id)})
                 connection.commit()
             except UniqueViolation:
                 connection.rollback()
@@ -728,6 +802,14 @@ def create_router(current_user, get_connection, hub):
         data = result.get('data')
         if not isinstance(data, dict) or data.get('status') not in ('applied', 'rejected', 'unknown'):
             raise HTTPException(502, 'El gateway no devolvió un resultado válido de la prueba')
+        with get_connection() as connection:
+            record_change(connection, branch_id, user, 'light.tested',
+                          node_id=device_id, before=None,
+                          after={'channel': body.channel,
+                                 'durationSeconds': body.duration_seconds,
+                                 'status': data.get('status'), 'light': data.get('light')},
+                          message='Prueba de luz solicitada')
+            connection.commit()
         response.headers['Cache-Control'] = 'no-store'
         return data
 

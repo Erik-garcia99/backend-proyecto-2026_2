@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import db
 from .gateway_registry import active_token
+from .logs import record_change
 from .permissions import is_admin, require_branch_actor
 
 
@@ -466,6 +467,11 @@ def create_router(current_user, get_connection, hub):
                            (branch_id, product_id, guide_point_id, created_by)
                        VALUES (%s,%s,%s,%s)''',
                     (branch_id, body.product_id, body.guide_point_id, user['id']))
+                record_change(connection, branch_id, user, 'guide.product_assigned',
+                              before={'lightId': str(body.guide_point_id),
+                                      'productId': str(body.replace_product_id) if body.replace_product_id else None},
+                              after={'lightId': str(body.guide_point_id),
+                                     'productId': str(body.product_id), 'name': product['name']})
                 connection.commit()
             except UniqueViolation:
                 connection.rollback()
@@ -494,6 +500,9 @@ def create_router(current_user, get_connection, hub):
                     WHERE branch_id=%s AND product_id=%s''', (branch_id, product_id))
             if not getattr(cursor, 'rowcount', 1):
                 raise HTTPException(404, 'El producto no estaba asociado a ninguna luz')
+            record_change(connection, branch_id, user, 'guide.product_unassigned',
+                          before={'productId': str(product_id)}, after=None,
+                          message='Producto desasociado de la luz')
             connection.commit()
         return Response(status_code=204)
 

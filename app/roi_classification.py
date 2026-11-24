@@ -170,9 +170,10 @@ def load_roi(connection, branch_id: UUID, roi_id: UUID, user):
 
 
 def _reader_context(row: dict) -> dict:
-    return {'camera_node_id': row['camera_node_id'], 'config_version': row['config_version'],
-            'calibration_version': row['calibration_version'],
-            'calibration_status': row['calibration_status']}
+    return {'camera_node_id': row.get('camera_node_id') or row.get('node_id'),
+            'config_version': row.get('config_version'),
+            'calibration_version': row.get('calibration_version'),
+            'calibration_status': row.get('calibration_status')}
 
 
 def default_reader(row: dict) -> RoiOccupancyResponse:
@@ -294,7 +295,7 @@ STATE_ROWS_SQL = '''
     SELECT r.id AS roi_id, r.product_id, r.name AS roi_name, p.sku,
            r.threshold_empty_pct, r.threshold_low_pct, r.threshold_medium_pct,
            r.confirm_samples, r.physical_config_version, r.calibration_status,
-           s.id AS shelf_id, s.name AS shelf_name, s.branch_id,
+           s.id AS shelf_id, s.name AS shelf_name, s.branch_id, s.camera_node_id,
            s.roi_applied_version AS config_version,
            n.id AS node_id, g.id AS gateway_id, c.calibration_version,
            st.status, st.occupancy_pct, st.confidence,
@@ -316,8 +317,16 @@ STATE_ROWS_SQL = '''
 def scan_branch_states(get_connection, branch_id: UUID, reader: RoiReader | None = None):
     """Clasifica todas las ROI activas de una sucursal. Lo usará el monitor del paso 2."""
     with get_connection() as connection:
-        require_branch(connection, branch_id, {'is_superuser': True, 'role': 'sudo',
-                                               'organization_id': None, 'branch_id': branch_id})
+        # Monitor interno: una sucursal dada de baja no debe lanzar HTTPException
+        # ni detener el escaneo del resto de sucursales.
+        branch = connection.execute(
+            '''SELECT b.id, b.organization_id FROM branch b
+               JOIN organization o ON o.id=b.organization_id
+               WHERE b.id=%s AND b.is_active AND o.is_active''',
+            (branch_id,)).fetchone()
+        if not branch:
+            log.info('Sucursal %s inactiva; se omite el escaneo de estados visuales', branch_id)
+            return 0
         rows = connection.execute(STATE_ROWS_SQL, (branch_id,)).fetchall()
         for row in rows:
             context = {**_reader_context(row), 'branch_id': str(branch_id), 'roi_id': str(row['roi_id'])}

@@ -122,6 +122,30 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(len(conn.inserts), 1)
         self.assertEqual(conn.inserts[0]['args'][1], 'stock_low')
 
+    def test_only_active_branches_and_organizations_are_scanned(self):
+        class CaptureConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.branch_sql = None
+
+            def execute(self, sql, args=()):
+                if 'SELECT DISTINCT s.branch_id' in sql:
+                    self.branch_sql = sql
+                    result = Mock()
+                    result.fetchall.return_value = []
+                    return result
+                return super().execute(sql, args)
+
+        connection = CaptureConnection()
+
+        @contextmanager
+        def connect():
+            yield connection
+
+        self.assertEqual(scan_visual_states(connect), 0)
+        self.assertIn('b.is_active', connection.branch_sql)
+        self.assertIn('o.is_active', connection.branch_sql)
+
 
 if __name__ == '__main__':
     unittest.main()
