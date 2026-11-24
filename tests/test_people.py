@@ -155,7 +155,7 @@ class PeopleEndpointTests(unittest.TestCase):
         self.assertEqual(self.connection.commits, 1)
 
     def test_create_employee_accepts_any_assignable_role(self):
-        for role in ('manager', 'rh', 'gerencia', 'employee', 'staff'):
+        for role in ('manager', 'rh', 'gerencia', 'employee'):
             with self.subTest(role=role):
                 self.connection = FakeConnection()
                 response = self.client.post(f'/branches/{BRANCH}/employees', json={
@@ -165,7 +165,8 @@ class PeopleEndpointTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 201, response.text)
                 self.assertEqual(response.json()['role'], role,
                                  'El valor del rol viaja sin traducir al backend')
-        for reserved in ('owner', 'sudo', 'customer'):
+        # `staff` era alias de `employee`: no se crea, pero sigue listándose.
+        for reserved in ('owner', 'sudo', 'customer', 'staff'):
             with self.subTest(reserved=reserved):
                 self.connection = FakeConnection()
                 response = self.client.post(f'/branches/{BRANCH}/employees', json={
@@ -173,6 +174,12 @@ class PeopleEndpointTests(unittest.TestCase):
                     'first_name': 'X', 'last_name': 'Y', 'role': reserved,
                 })
                 self.assertEqual(response.status_code, 422)
+
+        self.connection = FakeConnection()
+        response = self.client.get(f'/branches/{BRANCH}/employees')
+        self.assertEqual(response.status_code, 200, response.text)
+        list_params = next(params for sql, params in self.connection.executed if 'FROM "user"' in sql)
+        self.assertIn('staff', list_params[2], 'Los registros staff antiguos siguen visibles')
 
     def test_create_employee_rejects_duplicated_email(self):
         failing = FakeConnection(error=UniqueViolation('duplicado'))

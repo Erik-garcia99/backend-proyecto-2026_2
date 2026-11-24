@@ -23,10 +23,14 @@ from .permissions import require_branch_actor
 from .schemas import EMAIL_PATTERN
 from .security import hash_password
 
-# Roles que el encargado puede asignar desde el CRUD de personal. `sudo` y
-# `owner` quedan fuera: sudo es un único administrador de la plataforma y
-# owner es quien la inicia; no se crean desde esta pantalla.
-ASSIGNABLE_ROLES = frozenset({'manager', 'rh', 'gerencia', 'employee', 'staff'})
+# `employee` es el rol del personal desde el inicio (lo crea /auth/register).
+# `staff` era un alias histórico: ya no se ofrece al dar de alta, pero se
+# conserva en la lectura para no ocultar registros antiguos.
+STAFF_ROLES_ALL = frozenset({'manager', 'rh', 'gerencia', 'employee', 'staff'})
+ASSIGNABLE_ROLES = frozenset({'manager', 'rh', 'gerencia', 'employee'})
+
+# `sudo` y `owner` quedan fuera: sudo es el administrador único de la
+# plataforma y owner es quien la inicia; no se crean desde esta pantalla.
 
 
 # --------------------------------------------------------------------------- #
@@ -135,12 +139,12 @@ def _supplier(row):
 
 
 def _get_person(connection, user_id, branch, *, role, include_inactive=False):
-    clauses = ['id=%s', 'branch_id=%s' if role in ASSIGNABLE_ROLES else 'branch_id IS NULL',
+    clauses = ['id=%s', 'branch_id=%s' if role in STAFF_ROLES_ALL else 'branch_id IS NULL',
                'organization_id=%s', 'lower(role)=ANY(%s)']
     args = [user_id, branch['organization_id']]
-    if role in ASSIGNABLE_ROLES:
+    if role in STAFF_ROLES_ALL:
         args.insert(1, branch['id'])
-    args.append([role] if role not in ASSIGNABLE_ROLES else sorted(ASSIGNABLE_ROLES))
+    args.append([role] if role not in STAFF_ROLES_ALL else sorted(STAFF_ROLES_ALL))
     if not include_inactive:
         clauses.append('deactivated_at IS NULL')
     row = connection.execute(
@@ -184,7 +188,7 @@ def create_router(current_user, get_connection):
         with get_connection() as connection:
             branch = require_branch_actor(connection, branch_id, user, admin=True)
             clauses = ['branch_id=%s', 'organization_id=%s', 'lower(role)=ANY(%s)']
-            args = [branch['id'], branch['organization_id'], sorted(ASSIGNABLE_ROLES)]
+            args = [branch['id'], branch['organization_id'], sorted(STAFF_ROLES_ALL)]
             if not include_inactive:
                 clauses.append('deactivated_at IS NULL')
             rows = connection.execute(
@@ -198,7 +202,7 @@ def create_router(current_user, get_connection):
                         user=Depends(current_user)):
         role = body.role.lower()
         if role not in ASSIGNABLE_ROLES:
-            raise HTTPException(422, 'El rol debe ser manager, rh, gerencia, employee o staff; owner y sudo no se crean aquí')
+            raise HTTPException(422, 'El rol debe ser manager, rh, gerencia o employee; owner, sudo y staff no se crean aquí')
         with get_connection() as connection:
             branch = require_branch_actor(connection, branch_id, user, admin=True)
             args = (branch['organization_id'], branch['id'], body.email.lower(),
@@ -236,7 +240,7 @@ def create_router(current_user, get_connection):
         if 'role' in changes:
             changes['role'] = changes['role'].lower()
             if changes['role'] not in ASSIGNABLE_ROLES:
-                raise HTTPException(422, 'El rol debe ser manager, rh, gerencia, employee o staff')
+                raise HTTPException(422, 'El rol debe ser manager, rh, gerencia o employee')
         if not changes:
             raise HTTPException(422, 'No se enviaron cambios')
         if 'email' in changes:
