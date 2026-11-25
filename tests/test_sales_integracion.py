@@ -275,7 +275,8 @@ def test_ps06_anulacion_restituye_stock_y_segunda_anulacion_da_409(client):
     assert stock() == 3
 
     void = client.post(f'/api/v1/branches/{BRANCH}/sales/{sale_id}/void',
-                       json={'reason': 'Cliente se arrepintió'})
+                       json={'reason': 'Cliente se arrepintió'},
+                       headers={'Idempotency-Key': str(uuid4())})
     assert void.status_code == 200, void.text
     assert void.json()['status'] == 'voided'
     assert stock() == 5
@@ -287,7 +288,8 @@ def test_ps06_anulacion_restituye_stock_y_segunda_anulacion_da_409(client):
     assert ms[0]['quantity_after'] == 5
 
     second = client.post(f'/api/v1/branches/{BRANCH}/sales/{sale_id}/void',
-                         json={'reason': 'Otra vez'})
+                         json={'reason': 'Otra vez'},
+                         headers={'Idempotency-Key': str(uuid4())})
     assert second.status_code == 409, second.text
     assert second.json()['code'] == 'SALE_ALREADY_VOIDED'
     assert stock() == 5
@@ -302,7 +304,7 @@ def test_ps07_devolucion_parcial_valida_y_excedida_da_422(client):
     partial = client.post(url, json={
         'items': [{'product_id': str(P1), 'quantity': 1}],
         'reason': 'Producto defectuoso',
-    })
+    }, headers={'Idempotency-Key': str(uuid4())})
     assert partial.status_code == 200, partial.text
     assert stock() == 4
     assert len(movements_of_type('return')) == 1
@@ -311,7 +313,7 @@ def test_ps07_devolucion_parcial_valida_y_excedida_da_422(client):
     excedida = client.post(url, json={
         'items': [{'product_id': str(P1), 'quantity': 3}],
         'reason': 'Demasiados',
-    })
+    }, headers={'Idempotency-Key': str(uuid4())})
     assert excedida.status_code == 422, excedida.text
     assert excedida.json()['code'] == 'RETURN_EXCEEDS_SOLD'
     assert stock() == 4
@@ -320,7 +322,7 @@ def test_ps07_devolucion_parcial_valida_y_excedida_da_422(client):
     # 1 devuelto + 2 solicitados tampoco cabe en lo vendido.
     excedida2 = client.post(url, json={
         'items': [{'product_id': str(P1), 'quantity': 2}],
-    })
+    }, headers={'Idempotency-Key': str(uuid4())})
     assert excedida2.status_code == 422, excedida2.text
     assert excedida2.json()['code'] == 'RETURN_EXCEEDS_SOLD'
     assert stock() == 4
@@ -339,7 +341,7 @@ def test_ps08_confirmar_recepcion_dos_veces_aplica_una_sola_entrada(client):
     assert stock(P2) == 3
 
     url = f'/api/v1/branches/{BRANCH}/goods-receipts/{receipt["id"]}/confirm'
-    first = client.post(url)
+    first = client.post(url, headers={'Idempotency-Key': str(uuid4())})
     assert first.status_code == 200, first.text
     assert first.json()['status'] == 'confirmed'
     assert stock(P2) == 7
@@ -350,7 +352,7 @@ def test_ps08_confirmar_recepcion_dos_veces_aplica_una_sola_entrada(client):
     assert ms[0]['quantity_delta'] == 4
     assert ms[0]['quantity_after'] == 7
 
-    second = client.post(url)
+    second = client.post(url, headers={'Idempotency-Key': str(uuid4())})
     assert second.status_code == 200, second.text
     assert second.json() == first.json()
     assert stock(P2) == 7

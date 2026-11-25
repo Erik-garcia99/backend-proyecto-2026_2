@@ -471,12 +471,31 @@ def create_router(current_user, get_connection):
         return after
 
     @router.post('/branches/{branch_id}/sales/{sale_id}/void')
-    def void_sale(branch_id: UUID, sale_id: UUID, request: VoidRequest, user=Depends(current_user)):
+    def void_sale(branch_id: UUID, sale_id: UUID, request: VoidRequest,
+                  idempotency_key: str = Header(..., alias='Idempotency-Key'),
+                  user=Depends(current_user)):
         require_action(user, 'pos.sale.void')
+        digest = _body_hash({'sale_id': str(sale_id), 'reason': request.reason})
         with get_connection() as conn:
             with conn.cursor() as cursor:
                 try:
                     branch_org(cursor, user, branch_id)
+                    inserted = cursor.execute(
+                        '''INSERT INTO idempotency_key (branch_id, key, user_id, body_hash, status)
+                           VALUES (%s,%s,%s,%s,'pending')
+                           ON CONFLICT (branch_id, key) DO NOTHING RETURNING id''',
+                        (branch_id, idempotency_key, user['id'], digest)).fetchone()
+                    if not inserted:
+                        existing = cursor.execute(
+                            '''SELECT body_hash, response, status FROM idempotency_key
+                               WHERE branch_id=%s AND key=%s''',
+                            (branch_id, idempotency_key)).fetchone()
+                        if existing and existing['body_hash'] != digest:
+                            raise PosError(409, 'IDEMPOTENCY_CONFLICT',
+                                           'La clave de idempotencia ya se usó con otro contenido.')
+                        if existing and existing['status'] == 'completed' and existing['response']:
+                            return JSONResponse(status_code=200, content=existing['response'])
+                        raise PosError(409, 'VOID_IN_PROGRESS', 'La anulación con esta clave está en proceso.')
                     sale = cursor.execute(
                         '''SELECT id, status FROM sale WHERE id=%s AND branch_id=%s FOR UPDATE''',
                         (sale_id, branch_id)).fetchone()
@@ -499,18 +518,42 @@ def create_router(current_user, get_connection):
                         '''UPDATE sale SET status='voided', updated_at=NOW(),
                            notes=COALESCE(notes || E'\\n', '') || %s WHERE id=%s''',
                         (f"Anulada: {request.reason}", sale_id))
-                    return {'id': str(sale_id), 'status': 'voided'}
+                    response = {'id': str(sale_id), 'status': 'voided'}
+                    cursor.execute(
+                        '''UPDATE idempotency_key SET response=%s, status='completed'
+                           WHERE branch_id=%s AND key=%s''',
+                        (json.dumps(response), branch_id, idempotency_key))
+                    return response
                 except PosError:
                     conn.rollback()
                     raise
 
     @router.post('/branches/{branch_id}/sales/{sale_id}/returns')
-    def return_sale(branch_id: UUID, sale_id: UUID, request: ReturnRequest, user=Depends(current_user)):
+    def return_sale(branch_id: UUID, sale_id: UUID, request: ReturnRequest,
+                    idempotency_key: str = Header(..., alias='Idempotency-Key'),
+                    user=Depends(current_user)):
         require_action(user, 'pos.sale.return')
+        digest = _body_hash({'sale_id': str(sale_id), **request.model_dump(mode='json')})
         with get_connection() as conn:
             with conn.cursor() as cursor:
                 try:
                     branch_org(cursor, user, branch_id)
+                    inserted = cursor.execute(
+                        '''INSERT INTO idempotency_key (branch_id, key, user_id, body_hash, status)
+                           VALUES (%s,%s,%s,%s,'pending')
+                           ON CONFLICT (branch_id, key) DO NOTHING RETURNING id''',
+                        (branch_id, idempotency_key, user['id'], digest)).fetchone()
+                    if not inserted:
+                        existing = cursor.execute(
+                            '''SELECT body_hash, response, status FROM idempotency_key
+                               WHERE branch_id=%s AND key=%s''',
+                            (branch_id, idempotency_key)).fetchone()
+                        if existing and existing['body_hash'] != digest:
+                            raise PosError(409, 'IDEMPOTENCY_CONFLICT',
+                                           'La clave de idempotencia ya se usó con otro contenido.')
+                        if existing and existing['status'] == 'completed' and existing['response']:
+                            return JSONResponse(status_code=200, content=existing['response'])
+                        raise PosError(409, 'RETURN_IN_PROGRESS', 'La devolución con esta clave está en proceso.')
                     sale = cursor.execute(
                         'SELECT id, status FROM sale WHERE id=%s AND branch_id=%s FOR UPDATE',
                         (sale_id, branch_id)).fetchone()
@@ -538,7 +581,12 @@ def create_router(current_user, get_connection):
                                                 request.reason, sale_id=sale_id, user_id=user['id'])
                         already[pid] = already.get(pid, 0) + item.quantity
                         out.append({'product_id': pid, 'quantity': item.quantity, 'quantity_after': after})
-                    return {'sale_id': str(sale_id), 'items': out}
+                    response = {'sale_id': str(sale_id), 'items': out}
+                    cursor.execute(
+                        '''UPDATE idempotency_key SET response=%s, status='completed'
+                           WHERE branch_id=%s AND key=%s''',
+                        (json.dumps(response), branch_id, idempotency_key))
+                    return response
                 except PosError:
                     conn.rollback()
                     raise
@@ -633,12 +681,32 @@ def create_router(current_user, get_connection):
                 return [receipt_payload(cursor, row['id']) for row in rows]
 
     @router.post('/branches/{branch_id}/goods-receipts/{receipt_id}/confirm')
-    def confirm_receipt(branch_id: UUID, receipt_id: UUID, user=Depends(current_user)):
+    def confirm_receipt(branch_id: UUID, receipt_id: UUID,
+                        idempotency_key: str = Header(..., alias='Idempotency-Key'),
+                        user=Depends(current_user)):
         require_action(user, 'pos.receipt.confirm')
+        digest = _body_hash({'receipt_id': str(receipt_id)})
         with get_connection() as conn:
             with conn.cursor() as cursor:
                 try:
                     branch_org(cursor, user, branch_id)
+                    inserted = cursor.execute(
+                        '''INSERT INTO idempotency_key (branch_id, key, user_id, body_hash, status)
+                           VALUES (%s,%s,%s,%s,'pending')
+                           ON CONFLICT (branch_id, key) DO NOTHING RETURNING id''',
+                        (branch_id, idempotency_key, user['id'], digest)).fetchone()
+                    if not inserted:
+                        existing = cursor.execute(
+                            '''SELECT body_hash, response, status FROM idempotency_key
+                               WHERE branch_id=%s AND key=%s''',
+                            (branch_id, idempotency_key)).fetchone()
+                        if existing and existing['body_hash'] != digest:
+                            raise PosError(409, 'IDEMPOTENCY_CONFLICT',
+                                           'La clave de idempotencia ya se usó con otro contenido.')
+                        if existing and existing['status'] == 'completed' and existing['response']:
+                            return JSONResponse(status_code=200, content=existing['response'])
+                        raise PosError(409, 'RECEIPT_CONFIRM_IN_PROGRESS',
+                                       'La confirmación con esta clave está en proceso.')
                     receipt = cursor.execute(
                         '''SELECT id, status FROM goods_receipt
                            WHERE id=%s AND branch_id=%s FOR UPDATE''',
@@ -646,7 +714,12 @@ def create_router(current_user, get_connection):
                     if not receipt:
                         raise PosError(404, 'RECEIPT_NOT_FOUND', 'Recepción no encontrada.')
                     if receipt['status'] == 'confirmed':
-                        return receipt_payload(cursor, receipt_id)
+                        response = receipt_payload(cursor, receipt_id)
+                        cursor.execute(
+                            '''UPDATE idempotency_key SET response=%s, status='completed'
+                               WHERE branch_id=%s AND key=%s''',
+                            (json.dumps(response), branch_id, idempotency_key))
+                        return response
                     items = cursor.execute(
                         '''SELECT product_id, received_units FROM goods_receipt_item
                            WHERE goods_receipt_id=%s''', (receipt_id,)).fetchall()
@@ -658,7 +731,12 @@ def create_router(current_user, get_connection):
                     cursor.execute(
                         "UPDATE goods_receipt SET status='confirmed', received_at=NOW() WHERE id=%s",
                         (receipt_id,))
-                    return receipt_payload(cursor, receipt_id)
+                    response = receipt_payload(cursor, receipt_id)
+                    cursor.execute(
+                        '''UPDATE idempotency_key SET response=%s, status='completed'
+                           WHERE branch_id=%s AND key=%s''',
+                        (json.dumps(response), branch_id, idempotency_key))
+                    return response
                 except PosError:
                     conn.rollback()
                     raise
