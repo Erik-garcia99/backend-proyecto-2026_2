@@ -482,3 +482,21 @@ def test_ps09_otra_sucursal_y_otra_organizacion_se_rechazan_y_se_registran(caplo
     assert remoto.json()['code'] == 'BRANCH_NOT_FOUND'
     assert any(r.message == 'pos.access.denied' and getattr(r, 'reason', None) == 'other_organization'
                for r in caplog.records)
+
+
+# PS-15 -----------------------------------------------------------------------
+def test_ps15_logs_no_contienen_tokens_ni_datos_personales(caplog):
+    import logging
+    caplog.set_level(logging.DEBUG, logger='selfiq.pos')
+    client = make_client()
+    key = str(uuid4())
+    response = sell(client, key, sale_payload())
+    assert response.status_code == 201, response.text
+
+    texto = caplog.text
+    # No deben aparecer tokens completos ni la clave de idempotencia.
+    assert 'Bearer ' not in texto
+    assert key not in texto
+    # No debe aparecer la contraseña de prueba ni patrones de email.
+    assert PASSWORD not in texto
+    assert '@' not in texto
