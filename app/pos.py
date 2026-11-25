@@ -159,6 +159,24 @@ def create_router(current_user, get_connection):
             raise PosError(422, 'PRODUCT_NOT_FOUND', 'Producto no encontrado.', {'product_id': str(product_id)})
         return row
 
+    def resolve_customer_phone(cursor, org_id, phone):
+        """Resuelve el cliente por teléfono (decisión POS ↔ Cliente 24/11)."""
+        digits = ''.join(ch for ch in str(phone) if ch.isdigit())
+        if len(digits) < 8:
+            raise PosError(422, 'INVALID_CUSTOMER_PHONE', 'El teléfono del cliente no es válido.')
+        rows = cursor.execute(
+            '''SELECT id FROM "user"
+               WHERE organization_id=%s AND role='customer' AND deactivated_at IS NULL
+                 AND regexp_replace(phone_number, '\\D', '', 'g')=%s
+               LIMIT 2''',
+            (org_id, digits)).fetchall()
+        if not rows:
+            raise PosError(422, 'CUSTOMER_NOT_FOUND', 'No hay un cliente registrado con ese teléfono.')
+        if len(rows) > 1:
+            raise PosError(409, 'CUSTOMER_PHONE_AMBIGUOUS',
+                           'Hay más de un cliente con ese teléfono; regulariza el catálogo antes de vender.')
+        return str(rows[0]['id']), digits
+
     @router.get('/branches/{branch_id}/products')
     def search_products(branch_id: UUID, search: str = Query(default=''), limit: int = Query(default=50, ge=1, le=100),
                         user=Depends(current_user)):
@@ -264,6 +282,15 @@ def create_router(current_user, get_connection):
                     org_id = branch_org(cursor, user, branch_id)
                     require_seller(cursor, user, branch_id)
                     require_unlock(user, branch_id, x_pos_unlock)
+                    customer_id = request.customer_id
+                    customer_phone = None
+                    if request.customer_phone:
+                        resolved_id, customer_phone = resolve_customer_phone(
+                            cursor, org_id, request.customer_phone)
+                        if customer_id and str(customer_id) != resolved_id:
+                            raise PosError(409, 'CUSTOMER_MISMATCH',
+                                           'El teléfono no corresponde al cliente indicado.')
+                        customer_id = UUID(resolved_id)
                     inserted = cursor.execute(
                         '''INSERT INTO idempotency_key (branch_id, key, user_id, body_hash, status)
                            VALUES (%s,%s,%s,%s,'pending')
@@ -329,11 +356,12 @@ def create_router(current_user, get_connection):
                     sale_number = f"V-{datetime.now(timezone.utc):%Y%m%d%H%M%S}-{uuid4().hex[:6].upper()}"
                     sale = cursor.execute(
                         '''INSERT INTO sale (id, branch_id, sale_number, cashier_id, customer_id,
-                                            subtotal, tax, discount, total, payment_method, status, notes)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,0,%s,%s,'completed',%s)
+                                            customer_phone, subtotal, tax, discount, total,
+                                            payment_method, status, notes)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,0,%s,%s,'completed',%s)
                            RETURNING id, sale_number, status, subtotal, tax, discount, total,
-                                     payment_method, customer_id, created_at''',
-                        (sale_id, branch_id, sale_number, user['id'], request.customer_id,
+                                     payment_method, customer_id, customer_phone, created_at''',
+                        (sale_id, branch_id, sale_number, user['id'], customer_id, customer_phone,
                          subtotal, tax_total, total, payment.method, request.notes)).fetchone()
 
                     out_items = []
@@ -368,6 +396,7 @@ def create_router(current_user, get_connection):
                         'total': float(sale['total']),
                         'payment_method': sale['payment_method'],
                         'customer_id': str(sale['customer_id']) if sale['customer_id'] else None,
+                        'customer_phone': sale['customer_phone'],
                         'created_at': _iso(sale['created_at']),
                         'items': [{
                             **{k: (str(v) if k in {'id', 'product_id'} else v) for k, v in item.items()},

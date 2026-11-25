@@ -35,7 +35,10 @@ class InventoryOut(BaseModel):
 
 
 class SaleCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     customer_id: UUID | None = None
+    customer_phone: str | None = Field(default=None, max_length=30)
     items: list[SaleItemInput] = Field(min_length=1)
     payment: PaymentInput = PaymentInput()
     notes: str | None = Field(default=None, max_length=500)
@@ -113,5 +116,6 @@ class SaleOut(BaseModel):
     total: Decimal
     payment_method: str
     customer_id: UUID | None = None
+    customer_phone: str | None = None
     created_at: str | None = None
     items: list[SaleItemOut] = []
