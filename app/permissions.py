@@ -12,6 +12,12 @@ ADMIN_ROLES = frozenset({'owner', 'manager', 'rh', 'gerencia'})
 STAFF_ROLES = frozenset({'employee', 'staff'})
 CUSTOMER_ROLES = frozenset({'customer'})
 
+# POS (decisión del operador 23/11): vender no es un rol, es un permiso
+# otorgado por persona. SUDO y owner siempre pueden vender y otorgar;
+# RRHH otorga/revoca pero no vende salvo que también se le otorgue.
+POS_SELLER_ALWAYS_ROLES = frozenset({'owner'})
+POS_SELLER_GRANTOR_ROLES = frozenset({'owner', 'rh'})
+
 ADMIN = 'admin'
 STAFF = 'staff'
 CUSTOMER = 'customer'
@@ -39,6 +45,16 @@ def is_staff(user):
 def is_customer(user):
     """C: cliente de la app móvil."""
     return role(user) in CUSTOMER_ROLES
+
+
+def can_sell_pos_by_role(user):
+    """SUDO y owner venden siempre; los demás necesitan otorgamiento."""
+    return is_superuser(user) or role(user) in POS_SELLER_ALWAYS_ROLES
+
+
+def can_grant_pos_sellers(user):
+    """Puede otorgar/revocar vendedores del POS; RRHH hace la doble verificación."""
+    return is_superuser(user) or role(user) in POS_SELLER_GRANTOR_ROLES
 
 
 def require_actor(user, *allowed):

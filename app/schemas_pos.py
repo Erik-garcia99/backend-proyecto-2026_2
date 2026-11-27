@@ -35,7 +35,10 @@ class InventoryOut(BaseModel):
 
 
 class SaleCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
     customer_id: UUID | None = None
+    customer_phone: str | None = Field(default=None, max_length=30)
     items: list[SaleItemInput] = Field(min_length=1)
     payment: PaymentInput = PaymentInput()
     notes: str | None = Field(default=None, max_length=500)
@@ -84,6 +87,25 @@ class GoodsReceiptCreate(BaseModel):
     items: list[GoodsReceiptItem] = Field(min_length=1)
 
 
+class UnlockRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=200)
+
+
+class SellerGrantRequest(BaseModel):
+    user_id: UUID
+
+
+class SellerOut(BaseModel):
+    user_id: UUID
+    email: str
+    first_name: str
+    last_name: str
+    role: str
+    can_sell: bool
+    granted_by: UUID | None = None
+    granted_at: str | None = None
+
+
 class SaleOut(BaseModel):
     id: UUID
     sale_number: str
@@ -94,5 +116,6 @@ class SaleOut(BaseModel):
     total: Decimal
     payment_method: str
     customer_id: UUID | None = None
+    customer_phone: str | None = None
     created_at: str | None = None
     items: list[SaleItemOut] = []

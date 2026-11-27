@@ -27,7 +27,8 @@ from .registration_tokens import create_router as token_router, validate_branch_
 from .permissions import require_actor, require_branch_actor, CUSTOMER, is_superuser, role
 from .schemas import (BranchCreateRequest, BranchCreatedResponse, CustomerBranchItem, CustomerBranchesResponse,
                       CustomerCategoriesResponse, CustomerHomeResponse, CustomerProductItem, CustomerProductsResponse,
-                      CustomerRegisterRequest, CustomerShelfItem, CustomerShelvesResponse,
+                      CustomerPurchaseItem, CustomerPurchasesResponse,
+                       CustomerRegisterRequest, CustomerShelfItem, CustomerShelvesResponse,
                       LoginRequest,
                       LoginResponse, LogoutRequest, MessageResponse, NotificationPreferences,
                       NotificationPreferencesUpdate, PasswordChangeRequest, PendingUserResponse,
@@ -751,4 +752,48 @@ def customer_home(branch_id: UUID, user=Depends(current_user)):
                                stale_after_seconds=occupancy.stale_after_seconds,
                                status=occupancy.status, has_catalog=True,
                                occupancy_level=level, max_capacity_people=max_cap)
+@app.get('/customer/purchases', response_model=CustomerPurchasesResponse)
+def customer_purchases(page: int = Query(1, ge=1),
+                       page_size: int = Query(5, ge=1, le=20),
+                       user=Depends(current_user)):
+    """Historial de compras del cliente: por teléfono o por customer_id."""
+    require_actor(user, CUSTOMER)
+    org_id = user.get('organization_id')
+    if not org_id:
+        raise HTTPException(403, 'No tienes una organización asignada')
+    digits = ''.join(ch for ch in str(user.get('phone_number') or '') if ch.isdigit())
+
+    with db.get_connection() as connection:
+        clause = 'b.organization_id=%s AND (s.customer_id=%s'
+        params = [org_id, user['id']]
+        if len(digits) >= 8:
+            clause += " OR regexp_replace(s.customer_phone, '\\D', '', 'g')=%s"
+            params.append(digits)
+        clause += ')'
+        total = int(connection.execute(
+            f'SELECT COUNT(*) AS n FROM sale s JOIN branch b ON b.id=s.branch_id WHERE {clause}',
+            tuple(params)).fetchone()['n'])
+        total_pages = (total + page_size - 1) // page_size if total else 1
+        rows = connection.execute(
+            f'''SELECT s.id, s.sale_number, s.occurred_at, s.total, s.status, b.name AS branch_name
+                FROM sale s JOIN branch b ON b.id=s.branch_id
+                WHERE {clause}
+                ORDER BY s.occurred_at DESC, s.id DESC
+                LIMIT %s OFFSET %s''',
+            tuple(params + [page_size, (page - 1) * page_size])).fetchall()
+        items = []
+        for row in rows:
+            lines = connection.execute(
+                '''SELECT si.quantity, p.name FROM sale_item si
+                   JOIN product p ON p.id=si.product_id WHERE si.sale_id=%s ORDER BY si.id''',
+                (row['id'],)).fetchall()
+            items.append(CustomerPurchaseItem(
+                id=str(row['id']), sale_number=row['sale_number'],
+                occurred_at=row['occurred_at'], total=float(row['total']),
+                status=row['status'], branch_name=row['branch_name'],
+                items=[f"{line['quantity']} × {line['name']}" for line in lines],
+            ))
+    return CustomerPurchasesResponse(items=items, total=total, page=page,
+                                     page_size=page_size, total_pages=total_pages)
+
 app.include_router(alerts_router(current_user, db.get_connection))
