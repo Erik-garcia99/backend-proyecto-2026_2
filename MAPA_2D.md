@@ -1,6 +1,107 @@
-# Mapa móvil — primera entrega: borrador privado
+# Mapa móvil — borrador privado y visor 2D
 
 27/11/2026. Implementación local, no desplegada por el agente.
+
+## Tercera entrega — primer bloque del editor (E3, 27/11)
+
+Se añade el recorrido mínimo **agregar rectángulo → mover → guardar →
+reabrir**, sin modificar API, SQL ni permisos:
+
+- Agregar rectángulo al centro, con UUID estable y tamaño proporcional.
+  Se ajusta la vista para que la figura nueva no quede fuera del encuadre.
+- Seleccionar en el dibujo o desde la lista. El modo **Mover figuras**
+  arrastra la figura; **Recorrer mapa** mueve solo la cámara.
+- Arrastre en unidades del documento, respetando zoom y límites de la caja
+  girada. Un pellizco pasa a recorrer la cámara, sin arrastrar la figura.
+- Controles de nombre, posición horizontal/vertical, ancho, largo y giro.
+  Los tamaños siguen siendo relativos; no se piden medidas reales.
+- Quitar una figura requiere confirmación visible dentro de la pantalla.
+  No elimina estantes, productos ni equipos.
+- Guardado del documento completo, conservando otras figuras y sus IDs;
+  cambios locales, errores de red y conflictos no borran lo editado.
+- Validación local y backend: área/figuras finitas, dimensiones positivas,
+  nombre hasta 80 caracteres, giro `[0,360)`, hasta 200 figuras.
+  Reducir el área o girar/redimensionar una figura no recorta elementos
+  silenciosamente. Un ajuste inválido conserva los campos para corregirlos
+  y bloquea el guardado.
+- Las figuras se guardan solo con **Guardar borrador**, no al soltarlas.
+  Un simple zoom o cambio de selección no genera cambios del documento.
+
+Pendientes de E3: otras figuras en la paleta, paredes/puertas/ventanas,
+duplicar, deshacer/rehacer y gestos de redimensionamiento. El formulario
+ya permite cambiar tamaño y giro del rectángulo. Asociación a estantes,
+publicación y consulta de otros roles siguen en E4 y posteriores.
+
+Prueba manual de esta entrega: agregar rectángulo → arrastrar con/sin zoom →
+poner nombre → cambiar ancho/largo/giro → guardar → salir/reabrir →
+comprobar posición, tamaño, nombre e identidad. Probar mover cerca de un
+borde, cambiar a Recorrer mapa y un segundo dedo durante el arrastre.
+La aceptación física está pendiente; pruebas simuladas no certifican
+fluidez ni precisión táctil.
+
+Verificación local: **186/186** pruebas móviles; lint **0 errores / 177
+advertencias** existentes. Exportaciones de bundle Android y de la vista
+previa Expo en navegador correctas en `/tmp/opencode/selfiq-map-editor-android`
+y `/tmp/opencode/selfiq-map-editor-expo-preview`. La exportación de Expo web
+solo comprueba el proyecto móvil en navegador, no desarrolla ni modifica
+`Frontend-SelfIQ-26-2_WEB/`. No es APK, despliegue ni aceptación física.
+
+## Segunda entrega — espacio visual del mapa (27/11)
+
+Se añadió el lienzo en móvil, dentro de Panel → Mapa del local, por encima
+de los campos del área:
+
+- Recuadro proporcional al ancho/largo, con cuadrícula orientativa, sin metros.
+- Vista previa inmediata del área escrita, sin necesidad de guardar primero.
+  Campos inválidos muestran explicación; no se dibuja un tamaño inventado.
+- Pellizco, arrastre, botones de zoom, desplazamiento y Ajustar a pantalla.
+  Zoom entre 1× y 8×; desplazamiento acotado para no perder el área.
+- El gesto dentro del lienzo pausa el scroll de la página; liberarlo,
+  cancelarlo o desmontar el visor lo restaura. Se puede recorrer la página
+  deslizando fuera del recuadro.
+- Renderizador SVG común para rectángulos, elipses, hexágonos, paredes,
+  ventanas y puertas sencillas/dobles ya presentes en el documento.
+- Selección/resaltado por toque y lista alternativa de figuras con nombres
+  completos. Controles de al menos 44 px; etiquetas del dibujo abreviadas
+  cuando hace falta.
+- Si el documento está vacío, mostrar área vacía y explicación: **no insertar
+  estantes de ejemplo ni crear asociaciones automáticamente**.
+- Acercar, desplazar o seleccionar no cambia el documento guardado ni genera
+  revisiones. Cambiar proporciones reinicia la cámara de la vista.
+
+Archivos móviles principales: `components/maps/MapViewport.js`,
+`MapScene.js`, `utils/mapViewport.js` y la integración en `MapDraftScreen.js`.
+Se añadió `scrollEnabled` opcional a `Screen` (por defecto true, sin cambiar
+el comportamiento de las otras pantallas).
+
+Dependencia: `react-native-svg` **15.16.0**, instalada con
+`pnpm exec expo install react-native-svg` según Expo SDK 58; se actualizaron
+`package.json` y `pnpm-lock.yaml`, no `package-lock.json`. Está incluida en
+Expo Go compatible. Un binario propio previo que no incluya esta librería
+nativa requiere recompilarse; no basta una actualización OTA.
+
+**Sin cambios de backend ni migración adicional en esta segunda entrega.**
+La migración de la primera entrega sigue siendo necesaria si no se aplicó.
+No se modificó la web, el POS ni la navegación de clientes.
+
+**Todavía no se agregan/editan figuras desde la app.** El siguiente paso es
+el editor del creador (paleta, colocar, mover, tamaño y giro); después
+asociaciones, publicación y consulta de otros roles.
+
+Verificación móvil: **177/177** pruebas; lint **0 errores / 177 advertencias**
+en archivos existentes. Incluye pruebas simuladas de gesto/scroll,
+coordenadas, proporción, selección, símbolos y convivencia con el guardado.
+Exportación del bundle Android correcta con `pnpm exec expo export --platform android`,
+en `/tmp/opencode/selfiq-map-viewport-android`; no es un APK ni un despliegue.
+Pendiente aceptación física de fluidez, pellizco y scroll en teléfono
+pequeño/real; los tests de render no certifican el comportamiento nativo.
+
+Recorrido manual: abrir área vacía → cambiar ancho/largo → verificar forma
+del recuadro → acercar/pellizcar → arrastrar → Ajustar a pantalla →
+deslizar fuera del mapa → guardar/reabrir. Agregar figuras no forma parte
+de este recorrido todavía.
+
+## Primera entrega — borrador privado
 
 ## Alcance de esta entrega
 
