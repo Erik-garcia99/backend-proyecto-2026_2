@@ -30,3 +30,18 @@ CREATE TABLE IF NOT EXISTS public.idempotency_key (
 
 CREATE INDEX IF NOT EXISTS idx_idempotency_key_created
     ON public.idempotency_key (created_at);
+
+-- La tabla idempotency_key ya existía en el esquema base sin el UNIQUE.
+-- CREATE TABLE IF NOT EXISTS no lo agrega, así que lo aseguramos aparte.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+         WHERE conname = 'idempotency_key_branch_id_key'
+           AND conrelid = 'public.idempotency_key'::regclass
+    ) THEN
+        ALTER TABLE public.idempotency_key
+            ADD CONSTRAINT idempotency_key_branch_id_key UNIQUE (branch_id, key);
+    END IF;
+END
+$$;

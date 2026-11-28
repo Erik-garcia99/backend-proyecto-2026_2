@@ -105,6 +105,24 @@ class CustomerHomeResponse(BaseModel):
     max_capacity_people: int | None = None
 
 
+class CustomerPurchaseItem(BaseModel):
+    id: str
+    sale_number: str
+    occurred_at: datetime | None = None
+    total: float
+    status: str
+    branch_name: str | None = None
+    items: list[str] = []
+
+
+class CustomerPurchasesResponse(BaseModel):
+    items: list[CustomerPurchaseItem]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
 class LoginRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320, pattern=EMAIL_PATTERN)
     password: str
