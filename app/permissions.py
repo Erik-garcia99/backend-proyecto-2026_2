@@ -37,6 +37,11 @@ def is_admin(user):
     return is_superuser(user) or role(user) in ADMIN_ROLES
 
 
+def can_edit_map(user):
+    """Distribución del local: RRHH no edita, aunque administre otros módulos."""
+    return is_superuser(user) or role(user) in {'owner', 'manager', 'gerencia'}
+
+
 def is_staff(user):
     """E: empleado/personal sin funciones administrativas."""
     return role(user) in STAFF_ROLES
